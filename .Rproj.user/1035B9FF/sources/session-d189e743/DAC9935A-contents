@@ -1,0 +1,737 @@
+\documentclass[12pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+
+% Page geometry
+\geometry{
+    left=1in,
+    right=1in,
+    top=1in,
+    bottom=1in
+}
+
+% Line spacing
+\onehalfspacing
+
+% Title formatting
+\titleformat{\section}{\large\bfseries}{\thesection}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection}{0.5em}{}
+
+% Custom commands
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Var}{\operatorname{Var}}
+
+\begin{document}
+
+% Title
+\begin{center}
+    {\LARGE\bfseries METHODOLOGY}
+    
+    \vspace{0.3cm}
+    
+    {\Large\bfseries Scaled Regularised Optimality Criteria for Central Composite Designs}
+    
+    \vspace{0.5cm}
+    
+    {\large Ngonadi, Lilian Oluebube}
+    
+    \vspace{1cm}
+\end{center}
+
+%=============================================================================
+\section{Introduction}
+%=============================================================================
+
+This section presents the methodology for evaluating Central Composite Designs (CCDs) using scaled regularised alphabetic optimality criteria. The scaled regularisation approach addresses the limitation of unscaled regularisation, where efficiency values become artificially inflated at high dimensions due to the regularisation parameter dominating near-zero eigenvalues.
+
+%=============================================================================
+\section{Limitation of Unscaled Regularisation}
+%=============================================================================
+
+\subsection{The Inflation Problem}
+
+For the unscaled regularised information matrix:
+\begin{equation}
+M_\lambda = X'X + \lambda I_p
+\label{eq:unscaled}
+\end{equation}
+
+When $X'X$ is singular or near-singular (for $k \geq 7$), many eigenvalues $\mu_i \approx 0$. The regularised eigenvalues become:
+\begin{equation}
+\mu_i(M_\lambda) = \mu_i(X'X) + \lambda \approx \lambda
+\end{equation}
+
+\subsection{Effect on A-Optimality}
+
+The A-criterion becomes:
+\begin{equation}
+\tr(M_\lambda^{-1}) = \sum_{i=1}^{p} \frac{1}{\mu_i + \lambda} \approx \sum_{i: \mu_i \approx 0} \frac{1}{\lambda} = \frac{p_0}{\lambda}
+\end{equation}
+
+where $p_0$ is the number of near-zero eigenvalues.
+
+The A-efficiency:
+\begin{equation}
+A_{\text{eff},\lambda} = \frac{100p}{N \cdot \tr(M_\lambda^{-1})} \approx \frac{100p}{N \cdot p_0/\lambda} = \frac{100p\lambda}{N \cdot p_0}
+\end{equation}
+
+As $p_0$ increases with dimension, the efficiency becomes dominated by $\lambda$ rather than the design structure, leading to artificially high values approaching 100\%.
+
+\subsection{Effect on G-Optimality}
+
+Similarly, the maximum scaled prediction variance:
+\begin{equation}
+\hat{\sigma}^2_{\max,\lambda} = \max_{\mathbf{x} \in \mathcal{R}} \mathbf{f}'(\mathbf{x}) M_\lambda^{-1} \mathbf{f}(\mathbf{x})
+\end{equation}
+
+becomes dominated by $1/\lambda$ terms, causing G-efficiency to inflate.
+
+\subsection{Observed Behaviour}
+
+Table \ref{tab:inflation} demonstrates the inflation problem with unscaled regularisation ($\lambda = 0.01$).
+
+\begin{table}[h]
+\centering
+\caption{Efficiency inflation at high dimensions (unscaled $\lambda = 0.01$)}
+\label{tab:inflation}
+\begin{tabular}{cccc}
+\toprule
+$k$ & $A_{\text{eff}}$ (\%) & $D_{\text{eff}}$ (\%) & $G_{\text{eff}}$ (\%) \\
+\midrule
+3 & 35--52 & 37--62 & 13--53 \\
+4 & 28--51 & 35--63 & 6--49 \\
+5 & 20--52 & 32--63 & 3--46 \\
+6 & 18--56 & 29--64 & 3--61 \\
+7 & \textbf{99} & 27--67 & \textbf{82--87} \\
+8 & \textbf{99} & 26--69 & \textbf{84--89} \\
+9 & \textbf{99} & 25--72 & \textbf{82--93} \\
+10 & \textbf{99} & 24--75 & \textbf{84--94} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The A-efficiency converges to $\approx 99\%$ for all designs at $k \geq 7$, eliminating the ability to discriminate between design families.
+
+%=============================================================================
+\section{Scaled Regularisation}
+%=============================================================================
+
+\subsection{Definition}
+
+To address the inflation problem, a scaled regularised information matrix is adopted:
+
+\begin{equation}
+\boxed{
+M_{\lambda,s} = X'X + \lambda \cdot s(X'X) \cdot I_p
+}
+\label{eq:scaled_general}
+\end{equation}
+
+where $s(X'X)$ is a scaling factor derived from the information matrix.
+
+\subsection{Choice of Scaling Factor}
+
+Three scaling approaches are considered:
+
+\subsubsection{Approach 1: Trace-Based Scaling}
+
+\begin{equation}
+\boxed{
+M_{\lambda,s} = X'X + \lambda \cdot \frac{\tr(X'X)}{p} \cdot I_p
+}
+\label{eq:trace_scaling}
+\end{equation}
+
+The scaling factor $\dfrac{\tr(X'X)}{p}$ represents the \textbf{average eigenvalue} of $X'X$.
+
+\textbf{Rationale:} The regularisation is proportional to the average information content, ensuring it scales appropriately with the design size and dimension.
+
+\subsubsection{Approach 2: Maximum Eigenvalue Scaling}
+
+\begin{equation}
+M_{\lambda,s} = X'X + \lambda \cdot \lambda_{\max}(X'X) \cdot I_p
+\label{eq:max_scaling}
+\end{equation}
+
+\textbf{Rationale:} The regularisation is proportional to the largest eigenvalue, ensuring stability relative to the dominant information direction.
+
+\subsubsection{Approach 3: Diagonal Scaling}
+
+\begin{equation}
+M_{\lambda,s} = X'X + \lambda \cdot \diag(X'X)
+\label{eq:diag_scaling}
+\end{equation}
+
+\textbf{Rationale:} Each parameter is regularised proportionally to its own information content.
+
+\subsection{Recommended Approach: Trace-Based Scaling}
+
+For this study, \textbf{trace-based scaling} (Approach 1) is adopted because:
+
+\begin{enumerate}
+    \item It preserves the scalar nature of the regularisation (single parameter $\lambda$)
+    \item The average eigenvalue is a natural measure of overall information content
+    \item It is computationally simple: $\tr(X'X) = \sum_{i=1}^{p} (X'X)_{ii}$
+    \item It adapts automatically to different dimensions and design sizes
+\end{enumerate}
+
+\subsection{Scaled Regularisation Parameter}
+
+Define the \textbf{effective scaled regularisation parameter}:
+
+\begin{equation}
+\boxed{
+\lambda_s = \lambda \cdot \frac{\tr(X'X)}{p}
+}
+\label{eq:lambda_s}
+\end{equation}
+
+Then:
+\begin{equation}
+M_{\lambda,s} = X'X + \lambda_s \cdot I_p
+\label{eq:Mlambdas}
+\end{equation}
+
+\subsection{Properties of Scaled Regularisation}
+
+\subsubsection{Property 1: Dimension-Adaptive Regularisation}
+
+As dimension $k$ increases:
+\begin{itemize}
+    \item $\tr(X'X)$ increases (more design points, more information)
+    \item $\lambda_s$ increases proportionally
+    \item The regularisation ``keeps pace'' with the information matrix
+\end{itemize}
+
+\subsubsection{Property 2: Eigenvalue Behaviour}
+
+The eigenvalues of $M_{\lambda,s}$ are:
+\begin{equation}
+\mu_i(M_{\lambda,s}) = \mu_i(X'X) + \lambda_s = \mu_i(X'X) + \lambda \cdot \frac{\tr(X'X)}{p}
+\end{equation}
+
+For near-zero eigenvalues:
+\begin{equation}
+\mu_i(M_{\lambda,s}) \approx \lambda \cdot \frac{\tr(X'X)}{p} = \lambda \cdot \bar{\mu}
+\end{equation}
+
+where $\bar{\mu} = \dfrac{\tr(X'X)}{p}$ is the average eigenvalue.
+
+\subsubsection{Property 3: Bounded Efficiency Inflation}
+
+The scaled A-criterion:
+\begin{equation}
+\tr(M_{\lambda,s}^{-1}) = \sum_{i=1}^{p} \frac{1}{\mu_i + \lambda_s}
+\end{equation}
+
+For near-zero eigenvalues:
+\begin{equation}
+\frac{1}{\mu_i + \lambda_s} \approx \frac{1}{\lambda \cdot \bar{\mu}} = \frac{p}{\lambda \cdot \tr(X'X)}
+\end{equation}
+
+This is proportional to design structure through $\tr(X'X)$, not just $1/\lambda$.
+
+\subsubsection{Property 4: Preserved Design Discrimination}
+
+Because $\lambda_s$ depends on $\tr(X'X)$, designs with different information content receive different regularisation strengths, preserving the ability to discriminate between design families.
+
+%=============================================================================
+\section{Scaled Regularised Optimality Criteria}
+%=============================================================================
+
+\subsection{Scaled Regularised A-Optimality}
+
+\subsubsection{Definition}
+
+\begin{equation}
+\boxed{
+\Phi_A(M_{\lambda,s}) = \tr(M_{\lambda,s}^{-1}) = \tr\left[\left(X'X + \lambda \cdot \frac{\tr(X'X)}{p} \cdot I_p\right)^{-1}\right]
+}
+\label{eq:scaledAcrit}
+\end{equation}
+
+\subsubsection{Eigenvalue Representation}
+
+Let $\mu_1, \mu_2, \ldots, \mu_p$ be the eigenvalues of $X'X$ and $\bar{\mu} = \dfrac{1}{p}\sum_{i=1}^{p} \mu_i = \dfrac{\tr(X'X)}{p}$.
+
+Then:
+\begin{equation}
+\tr(M_{\lambda,s}^{-1}) = \sum_{i=1}^{p} \frac{1}{\mu_i + \lambda\bar{\mu}}
+\label{eq:scaledAtrace}
+\end{equation}
+
+\subsubsection{Scaled A-Efficiency}
+
+\begin{equation}
+\boxed{
+A_{\text{eff},\lambda,s} = \frac{100p}{N \cdot \tr(M_{\lambda,s}^{-1})} = \frac{100p}{N \cdot \displaystyle\sum_{i=1}^{p} \frac{1}{\mu_i + \lambda\bar{\mu}}}
+}
+\label{eq:scaledAeff}
+\end{equation}
+
+\subsection{Scaled Regularised D-Optimality}
+
+\subsubsection{Definition}
+
+\begin{equation}
+\boxed{
+\Phi_D(M_{\lambda,s}) = |M_{\lambda,s}| = \left|X'X + \lambda \cdot \frac{\tr(X'X)}{p} \cdot I_p\right|}
+\label{eq:scaledDcrit}
+\end{equation}
+
+\subsubsection{Eigenvalue Representation}
+
+\begin{equation}
+|M_{\lambda,s}| = \prod_{i=1}^{p} (\mu_i + \lambda\bar{\mu})
+\label{eq:scaledDdet}
+\end{equation}
+
+\subsubsection{Log-Determinant}
+
+For numerical stability:
+\begin{equation}
+\log|M_{\lambda,s}| = \sum_{i=1}^{p} \log(\mu_i + \lambda\bar{\mu})
+\label{eq:scaledlogdet}
+\end{equation}
+
+\subsubsection{Scaled D-Efficiency}
+
+\begin{equation}
+\boxed{
+D_{\text{eff},\lambda,s} = 100 \left(\frac{|M_{\lambda,s}|}{N}\right)^{1/p} = 100 \cdot \frac{\left(\displaystyle\prod_{i=1}^{p}(\mu_i + \lambda\bar{\mu})\right)^{1/p}}{N^{1/p}}
+}
+\label{eq:scaledDeff}
+\end{equation}
+
+\subsection{Scaled Regularised G-Optimality}
+
+\subsubsection{Scaled Prediction Variance}
+
+\begin{equation}
+\Var_{\lambda,s}(\hat{y}_\mathbf{x}) = \sigma^2 \mathbf{f}'(\mathbf{x}) M_{\lambda,s}^{-1} \mathbf{f}(\mathbf{x})
+\label{eq:scaledpredvar}
+\end{equation}
+
+\subsubsection{Scaled SPV}
+
+\begin{equation}
+\boxed{
+\text{SPV}_{\lambda,s}(\mathbf{x}) = N \cdot \mathbf{f}'(\mathbf{x}) M_{\lambda,s}^{-1} \mathbf{f}(\mathbf{x})
+}
+\label{eq:scaledSPV}
+\end{equation}
+
+\subsubsection{Scaled G-Criterion}
+
+\begin{equation}
+\boxed{
+\Phi_G(M_{\lambda,s}) = \max_{\mathbf{x} \in \mathcal{R}} N \cdot \mathbf{f}'(\mathbf{x}) M_{\lambda,s}^{-1} \mathbf{f}(\mathbf{x})
+}
+\label{eq:scaledGcrit}
+\end{equation}
+
+\subsubsection{Scaled G-Efficiency}
+
+\begin{equation}
+\boxed{
+G_{\text{eff},\lambda,s} = \frac{100p}{\max_{\mathbf{x} \in \mathcal{R}} N \cdot \mathbf{f}'(\mathbf{x}) M_{\lambda,s}^{-1} \mathbf{f}(\mathbf{x})} = \frac{100p}{N \cdot \hat{\sigma}^2_{\max,\lambda,s}}
+}
+\label{eq:scaledGeff}
+\end{equation}
+
+%=============================================================================
+\section{Derivation for $k = 3$ Factors with Scaled Regularisation}
+%=============================================================================
+
+\subsection{Computing the Scaling Factor}
+
+For a 3-factor CCD with design matrix $X$, the information matrix is:
+\begin{equation}
+X'X = \begin{pmatrix}
+N & 0 & 0 & 0 & x & x & x & 0 & 0 & 0 \\
+0 & x & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+0 & 0 & x & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+0 & 0 & 0 & x & 0 & 0 & 0 & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & y & f & f & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & f & y & f & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & f & f & y & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & f & 0 & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & f & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & f
+\end{pmatrix}
+\end{equation}
+
+where $x = f + 2\alpha^2$, $y = f + 2\alpha^4$, and $f$ is the number of factorial points.
+
+\subsubsection{Trace Computation}
+
+\begin{equation}
+\tr(X'X) = N + 3x + 3y + 3f
+\label{eq:tracek3}
+\end{equation}
+
+\subsubsection{Average Eigenvalue}
+
+With $p = 10$ parameters:
+\begin{equation}
+\bar{\mu} = \frac{\tr(X'X)}{p} = \frac{N + 3x + 3y + 3f}{10}
+\label{eq:avgeignk3}
+\end{equation}
+
+\subsubsection{Scaled Regularisation Parameter}
+
+\begin{equation}
+\lambda_s = \lambda \cdot \bar{\mu} = \lambda \cdot \frac{N + 3x + 3y + 3f}{10}
+\label{eq:lambdask3}
+\end{equation}
+
+\subsection{Scaled Regularised Information Matrix}
+
+\begin{equation}
+M_{\lambda,s} = X'X + \lambda_s I_{10}
+\end{equation}
+
+\begin{equation}
+M_{\lambda,s} = \begin{pmatrix}
+N + \lambda_s & 0 & 0 & 0 & x & x & x & 0 & 0 & 0 \\
+0 & x + \lambda_s & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+0 & 0 & x + \lambda_s & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+0 & 0 & 0 & x + \lambda_s & 0 & 0 & 0 & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & y + \lambda_s & f & f & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & f & y + \lambda_s & f & 0 & 0 & 0 \\
+x & 0 & 0 & 0 & f & f & y + \lambda_s & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & f + \lambda_s & 0 & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & f + \lambda_s & 0 \\
+0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & f + \lambda_s
+\end{pmatrix}
+\label{eq:Mlambdasfull}
+\end{equation}
+
+\subsection{Block Partition with Scaled Regularisation}
+
+Using the standard partition:
+
+\textbf{Block $A_{11,\lambda_s}$ ($4 \times 4$):}
+\begin{equation}
+A_{11,\lambda_s} = \begin{pmatrix}
+N + \lambda_s & 0 & 0 & 0 \\
+0 & x + \lambda_s & 0 & 0 \\
+0 & 0 & x + \lambda_s & 0 \\
+0 & 0 & 0 & x + \lambda_s
+\end{pmatrix}
+\end{equation}
+
+\textbf{Block $A_{22,\lambda_s}$ ($6 \times 6$):}
+\begin{equation}
+A_{22,\lambda_s} = \begin{pmatrix}
+y + \lambda_s & f & f & 0 & 0 & 0 \\
+f & y + \lambda_s & f & 0 & 0 & 0 \\
+f & f & y + \lambda_s & 0 & 0 & 0 \\
+0 & 0 & 0 & f + \lambda_s & 0 & 0 \\
+0 & 0 & 0 & 0 & f + \lambda_s & 0 \\
+0 & 0 & 0 & 0 & 0 & f + \lambda_s
+\end{pmatrix}
+\end{equation}
+
+\subsection{Inverse of $A_{22,\lambda_s}$}
+
+The upper $3 \times 3$ block:
+\begin{equation}
+B_{\lambda_s} = \begin{pmatrix}
+y + \lambda_s & f & f \\
+f & y + \lambda_s & f \\
+f & f & y + \lambda_s
+\end{pmatrix}
+\end{equation}
+
+\subsubsection{Determinant}
+
+\begin{equation}
+\det(B_{\lambda_s}) = (y + \lambda_s - f)^2(y + \lambda_s + 2f)
+\label{eq:detBlambdas}
+\end{equation}
+
+Define:
+\begin{equation}
+\boxed{
+D_{\lambda_s} = (y + \lambda_s - f)(y + \lambda_s + 2f)
+}
+\label{eq:Dlambdas}
+\end{equation}
+
+\subsubsection{Inverse Elements}
+
+\begin{align}
+\text{Diagonal:} \quad & \frac{y + \lambda_s + f}{D_{\lambda_s}} \\[6pt]
+\text{Off-diagonal:} \quad & \frac{-f}{D_{\lambda_s}}
+\end{align}
+
+\subsubsection{Full $A_{22,\lambda_s}^{-1}$}
+
+\begin{equation}
+A_{22,\lambda_s}^{-1} = \begin{pmatrix}
+\frac{y + \lambda_s + f}{D_{\lambda_s}} & \frac{-f}{D_{\lambda_s}} & \frac{-f}{D_{\lambda_s}} & 0 & 0 & 0 \\[6pt]
+\frac{-f}{D_{\lambda_s}} & \frac{y + \lambda_s + f}{D_{\lambda_s}} & \frac{-f}{D_{\lambda_s}} & 0 & 0 & 0 \\[6pt]
+\frac{-f}{D_{\lambda_s}} & \frac{-f}{D_{\lambda_s}} & \frac{y + \lambda_s + f}{D_{\lambda_s}} & 0 & 0 & 0 \\[6pt]
+0 & 0 & 0 & \frac{1}{f + \lambda_s} & 0 & 0 \\[6pt]
+0 & 0 & 0 & 0 & \frac{1}{f + \lambda_s} & 0 \\[6pt]
+0 & 0 & 0 & 0 & 0 & \frac{1}{f + \lambda_s}
+\end{pmatrix}
+\label{eq:A22lambdasinv}
+\end{equation}
+
+\subsection{Schur Complement with Scaled Regularisation}
+
+Following the partitioned inverse procedure:
+
+\begin{equation}
+A_{22,\lambda_s}^{-1}A_{21} = \begin{pmatrix}
+\frac{x}{y + \lambda_s + 2f} & 0 & 0 & 0 \\[6pt]
+\frac{x}{y + \lambda_s + 2f} & 0 & 0 & 0 \\[6pt]
+\frac{x}{y + \lambda_s + 2f} & 0 & 0 & 0 \\[6pt]
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0
+\end{pmatrix}
+\end{equation}
+
+\begin{equation}
+A_{12}A_{22,\lambda_s}^{-1}A_{21} = \begin{pmatrix}
+\frac{3x^2}{y + \lambda_s + 2f} & 0 & 0 & 0 \\[6pt]
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0
+\end{pmatrix}
+\end{equation}
+
+Define:
+\begin{equation}
+\boxed{
+Z_{1,\lambda_s} = (N + \lambda_s)(y + \lambda_s + 2f) - 3x^2
+}
+\label{eq:Z1lambdas}
+\end{equation}
+
+The scaled regularised Schur complement:
+\begin{equation}
+A_{11,\lambda_s} - A_{12}A_{22,\lambda_s}^{-1}A_{21} = \begin{pmatrix}
+\frac{Z_{1,\lambda_s}}{y + \lambda_s + 2f} & 0 & 0 & 0 \\[6pt]
+0 & x + \lambda_s & 0 & 0 \\
+0 & 0 & x + \lambda_s & 0 \\
+0 & 0 & 0 & x + \lambda_s
+\end{pmatrix}
+\end{equation}
+
+\subsection{Scaled Regularised $\bar{A}^{11}_{\lambda_s}$}
+
+\begin{equation}
+\boxed{
+\bar{A}^{11}_{\lambda_s} = \begin{pmatrix}
+\frac{y + \lambda_s + 2f}{Z_{1,\lambda_s}} & 0 & 0 & 0 \\[6pt]
+0 & \frac{1}{x + \lambda_s} & 0 & 0 \\[6pt]
+0 & 0 & \frac{1}{x + \lambda_s} & 0 \\[6pt]
+0 & 0 & 0 & \frac{1}{x + \lambda_s}
+\end{pmatrix}
+}
+\label{eq:A11barlambdas}
+\end{equation}
+
+\subsection{Scaled Regularised $\bar{A}^{22}_{\lambda_s}$}
+
+Define:
+\begin{equation}
+\boxed{
+Z_{2,\lambda_s} = (y + \lambda_s - f) \cdot Z_{1,\lambda_s}
+}
+\label{eq:Z2lambdas}
+\end{equation}
+
+\begin{equation}
+\boxed{
+\bar{A}^{22}_{\lambda_s} = \begin{pmatrix}
+\frac{(N+\lambda_s)(y+\lambda_s+f) - 2x^2}{Z_{2,\lambda_s}} & \frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & \frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & 0 & 0 & 0 \\[6pt]
+\frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & \frac{(N+\lambda_s)(y+\lambda_s+f) - 2x^2}{Z_{2,\lambda_s}} & \frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & 0 & 0 & 0 \\[6pt]
+\frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & \frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} & \frac{(N+\lambda_s)(y+\lambda_s+f) - 2x^2}{Z_{2,\lambda_s}} & 0 & 0 & 0 \\[6pt]
+0 & 0 & 0 & \frac{1}{f+\lambda_s} & 0 & 0 \\[6pt]
+0 & 0 & 0 & 0 & \frac{1}{f+\lambda_s} & 0 \\[6pt]
+0 & 0 & 0 & 0 & 0 & \frac{1}{f+\lambda_s}
+\end{pmatrix}
+}
+\label{eq:A22barlambdas}
+\end{equation}
+
+\subsection{Scaled Regularised A-Optimality Value}
+
+\begin{equation}
+\boxed{
+\tr(M_{\lambda,s}^{-1}) = \frac{y + \lambda_s + 2f}{Z_{1,\lambda_s}} + \frac{3}{x + \lambda_s} + \frac{3[(N+\lambda_s)(y+\lambda_s+f) - 2x^2]}{Z_{2,\lambda_s}} + \frac{3}{f + \lambda_s}
+}
+\label{eq:scaledAoptvalue}
+\end{equation}
+
+where $\lambda_s = \lambda \cdot \dfrac{N + 3x + 3y + 3f}{10}$.
+
+\subsection{Scaled Regularised D-Optimality Value}
+
+\begin{equation}
+\boxed{
+|M_{\lambda,s}| = \frac{(x + \lambda_s)^3(f + \lambda_s)^3}{(N + \lambda_s)^2}(y + \lambda_s - f)^2 \cdot Z_{1,\lambda_s}
+}
+\label{eq:scaledDoptvalue}
+\end{equation}
+
+\subsection{Scaled Regularised G-Optimality Value}
+
+For a point $\mathbf{f}(\mathbf{x}) = [1, x_1, x_2, x_3, x_1^2, x_2^2, x_3^2, x_1x_2, x_1x_3, x_2x_3]'$:
+
+Let:
+\begin{align}
+p_{\lambda_s} &= \frac{y + \lambda_s + 2f}{Z_{1,\lambda_s}} \\[4pt]
+q_{\lambda_s} &= \frac{-xf}{Z_{1,\lambda_s}} \\[4pt]
+r_{\lambda_s} &= \frac{1}{x + \lambda_s} \\[4pt]
+s_{\lambda_s} &= \frac{(N+\lambda_s)(y+\lambda_s+f) - 2x^2}{Z_{2,\lambda_s}} \\[4pt]
+t_{\lambda_s} &= \frac{x^2 - (N+\lambda_s)f}{Z_{2,\lambda_s}} \\[4pt]
+u_{\lambda_s} &= \frac{1}{f + \lambda_s}
+\end{align}
+
+Then:
+\begin{equation}
+\boxed{
+\begin{aligned}
+N \cdot \mathbf{f}'(\mathbf{x})M_{\lambda,s}^{-1}\mathbf{f}(\mathbf{x}) &= N \bigg[ p_{\lambda_s} + (2q_{\lambda_s} + r_{\lambda_s})\sum_{i=1}^{3} x_i^2 \\
+&\quad + s_{\lambda_s} \sum_{i=1}^{3} x_i^4 + (2t_{\lambda_s} + u_{\lambda_s})\sum_{i<j} x_i^2 x_j^2 \bigg]
+\end{aligned}
+}
+\label{eq:scaledGoptvalue}
+\end{equation}
+
+%=============================================================================
+\section{Selection of Base Regularisation Parameter $\lambda$}
+%=============================================================================
+
+\subsection{Grid Search with Scaled Regularisation}
+
+Evaluate the scaled regularised efficiency criteria over a grid of base $\lambda$ values:
+\begin{equation}
+\lambda \in \{10^{-1}, 10^{-2}, 10^{-3}, 10^{-4}, 10^{-5}\}
+\end{equation}
+
+For each $\lambda$, compute $\lambda_s = \lambda \cdot \dfrac{\tr(X'X)}{p}$ and evaluate all three efficiencies.
+
+\subsection{Selection Criteria}
+
+Select $\lambda$ that:
+\begin{enumerate}
+    \item Maintains discrimination between design families across all dimensions
+    \item Provides stable efficiency values (not artificially inflated)
+    \item Preserves the relative ranking of designs consistent with classical results for $k \leq 6$
+\end{enumerate}
+
+\subsection{Recommended Value}
+
+Based on empirical evaluation, $\lambda = 10^{-2}$ is recommended as the base parameter for scaled regularisation.
+
+%=============================================================================
+\section{Comparison: Unscaled vs Scaled Regularisation}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Comparison of regularisation approaches}
+\label{tab:comparison}
+\begin{tabular}{lll}
+\toprule
+Property & Unscaled ($\lambda I_p$) & Scaled ($\lambda \cdot \bar{\mu} \cdot I_p$) \\
+\midrule
+Regularisation strength & Fixed & Adapts to design \\
+High-$k$ A-efficiency & Inflated ($\to 100\%$) & Meaningful discrimination \\
+High-$k$ G-efficiency & Inflated & Meaningful discrimination \\
+D-efficiency & Less affected & Similar performance \\
+Design discrimination & Lost at high $k$ & Preserved \\
+Complexity & Simpler & Slightly more complex \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{When to Use Each Approach}
+
+\textbf{Use Unscaled Regularisation when:}
+\begin{itemize}
+    \item Analysing only low dimensions ($k \leq 6$)
+    \item Focusing primarily on D-optimality
+    \item Simplicity is paramount
+\end{itemize}
+
+\textbf{Use Scaled Regularisation when:}
+\begin{itemize}
+    \item Comparing designs across a wide range of dimensions ($k = 3$ to $10$)
+    \item A-optimality and G-optimality are important criteria
+    \item Meaningful efficiency values are required at high dimensions
+\end{itemize}
+
+%=============================================================================
+\section{Summary of Scaled Regularised Formulae}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Summary of scaled regularised optimality criteria}
+\label{tab:scaledsummary}
+\begin{tabular}{ll}
+\toprule
+Quantity & Formula \\
+\midrule
+Scaling factor & $\bar{\mu} = \dfrac{\tr(X'X)}{p}$ \\[10pt]
+Scaled parameter & $\lambda_s = \lambda \cdot \bar{\mu}$ \\[10pt]
+Regularised matrix & $M_{\lambda,s} = X'X + \lambda_s I_p$ \\[10pt]
+A-criterion & $\Phi_A = \displaystyle\sum_{i=1}^{p} \frac{1}{\mu_i + \lambda_s}$ \\[14pt]
+A-efficiency & $A_{\text{eff},\lambda,s} = \dfrac{100p}{N \cdot \tr(M_{\lambda,s}^{-1})}$ \\[14pt]
+D-criterion & $\Phi_D = \displaystyle\prod_{i=1}^{p} (\mu_i + \lambda_s)$ \\[14pt]
+D-efficiency & $D_{\text{eff},\lambda,s} = 100\left(\dfrac{|M_{\lambda,s}|}{N}\right)^{1/p}$ \\[14pt]
+G-criterion & $\Phi_G = \max_{\mathbf{x}} N\mathbf{f}'M_{\lambda,s}^{-1}\mathbf{f}$ \\[10pt]
+G-efficiency & $G_{\text{eff},\lambda,s} = \dfrac{100p}{N \cdot \hat{\sigma}^2_{\max,\lambda,s}}$ \\[14pt]
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key quantities for $k = 3$ with scaled regularisation:
+\begin{align}
+\lambda_s &= \lambda \cdot \frac{N + 3x + 3y + 3f}{10} \\[6pt]
+D_{\lambda_s} &= (y + \lambda_s - f)(y + \lambda_s + 2f) \\[6pt]
+Z_{1,\lambda_s} &= (N + \lambda_s)(y + \lambda_s + 2f) - 3x^2 \\[6pt]
+Z_{2,\lambda_s} &= (y + \lambda_s - f) \cdot Z_{1,\lambda_s}
+\end{align}
+
+%=============================================================================
+% References
+%=============================================================================
+\begin{thebibliography}{9}
+
+\bibitem[Chernoff(1953)]{chernoff1953}
+Chernoff, H. (1953). Locally optimal designs for estimating parameters. \textit{The Annals of Mathematical Statistics}, 24(4), 586--602.
+
+\bibitem[Hoerl \& Kennard(1970)]{hoerl1970}
+Hoerl, A. E., \& Kennard, R. W. (1970). Ridge regression: Biased estimation for nonorthogonal problems. \textit{Technometrics}, 12(1), 55--67.
+
+\bibitem[Marquardt(1970)]{marquardt1970}
+Marquardt, D. W. (1970). Generalized inverses, ridge regression, biased linear estimation, and nonlinear estimation. \textit{Technometrics}, 12(3), 591--612.
+
+\bibitem[Wald(1943)]{wald1943}
+Wald, A. (1943). On the efficient design of statistical investigations. \textit{The Annals of Mathematical Statistics}, 14(2), 134--140.
+
+\end{thebibliography}
+
+\end{document}

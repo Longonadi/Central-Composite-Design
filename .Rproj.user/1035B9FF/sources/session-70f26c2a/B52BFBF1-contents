@@ -1,0 +1,228 @@
+---
+title: "RecentPhDWORK"
+output: pdf_document
+date: "2026-01-31"
+---
+
+```{r}
+# ============================================================
+# OBJECTIVE 1 (R CODE ONLY)
+# Construct FCCD, RCCD, SCCD, OCCD for k = 3..10
+# Compute D-, A-, G- criteria for BOTH:
+#   (i) Cube region [-1,1]^k
+#   (ii) Unit ball (sphere region) ||x|| <= 1
+# ============================================================
+
+library(dplyr)
+library(tibble)
+library(readr)
+library(FrF2)
+
+# -----------------------------
+# Folders
+# -----------------------------
+dir.create("obj1_data", showWarnings = FALSE, recursive = TRUE)
+dir.create("obj1_results", showWarnings = FALSE, recursive = TRUE)
+
+set.seed(2026)
+
+# -----------------------------
+# (1) CCD generator (FCCD, RCCD, SCCD, OCCD placeholder)
+# -----------------------------
+make_ccd <- function(k, family = c("FCCD","RCCD","SCCD","OCCD"),
+                     nc = 5, rf = 1, ra = 1,
+                     core = c("full","frac")) {
+
+  family <- match.arg(family)
+  core   <- match.arg(core)
+
+  alpha <- switch(family,
+    "FCCD" = 1,
+    "RCCD" = (2^k)^(1/4),
+    "SCCD" = sqrt(k),           # common practical choice (you can replace later)
+    "OCCD" = (2^k)^(1/4)        # placeholder until strict orthogonal alpha is implemented
+  )
+
+  # Factorial core: full if k<=5 else fractional (32-run baseline)
+  if (core == "full" && k <= 5) {
+    fac <- as.data.frame(FrF2(nruns = 2^k, nfactors = k))
+  } else {
+    fac <- as.data.frame(FrF2(nruns = 2^5, nfactors = k))
+  }
+  fac <- fac[, 1:k, drop = FALSE]
+  colnames(fac) <- paste0("x", 1:k)
+
+  # Ensure coded levels are exactly -1/+1
+  fac <- mutate_all(fac, ~ifelse(. == 1, 1, -1))
+  fac_rep <- fac[rep(seq_len(nrow(fac)), times = rf), , drop = FALSE]
+
+  # Axial points
+  ax <- matrix(0, nrow = 2*k, ncol = k)
+  for (j in 1:k) {
+    ax[2*j - 1, j] <-  alpha
+    ax[2*j,     j] <- -alpha
+  }
+  ax <- as.data.frame(ax)
+  colnames(ax) <- paste0("x", 1:k)
+  ax_rep <- ax[rep(seq_len(nrow(ax)), times = ra), , drop = FALSE]
+
+  # Center points
+  cen <- as.data.frame(matrix(0, nrow = nc, ncol = k))
+  colnames(cen) <- paste0("x", 1:k)
+
+  pts <- bind_rows(fac_rep, ax_rep, cen)
+
+  DesignID <- paste0(family, "_k", k, "_nc", nc, "_rf", rf, "_ra", ra, "_", core)
+
+  meta <- tibble(
+    DesignID = DesignID,
+    k = k, family = family, core = core,
+    nc = nc, rf = rf, ra = ra,
+    alpha = alpha,
+    N  = nrow(pts),
+    Nf = nrow(fac_rep),
+    Na = nrow(ax_rep),
+    Nc = nrow(cen)
+  )
+
+  list(points = pts, meta = meta)
+}
+
+# -----------------------------
+# (2) Quadratic model matrix for CCD (2nd-order RSM)
+# intercept + linear + squares + two-way interactions
+# -----------------------------
+build_X_quadratic <- function(df) {
+  vars <- names(df)
+  form <- as.formula(paste0(
+    "~ ", paste(vars, collapse = " + "),
+    " + ", paste0("I(", vars, "^2)", collapse = " + "),
+    " + (", paste(vars, collapse = " + "), ")^2"
+  ))
+  model.matrix(form, data = df)
+}
+
+# -----------------------------
+# (3) Region samplers
+# -----------------------------
+sample_cube <- function(n, k) {
+  Z <- matrix(runif(n*k, -1, 1), ncol = k)
+  as.data.frame(Z)
+}
+
+# Uniform in unit ball: ||x|| <= 1
+sample_unit_ball <- function(n, k) {
+  Z <- matrix(rnorm(n*k), ncol = k)
+  Z <- Z / sqrt(rowSums(Z^2))
+  r <- runif(n)^(1/k)     # IMPORTANT: unit ball radius
+  Z <- Z * r
+  as.data.frame(Z)
+}
+
+# -----------------------------
+# (4) Compute D, A, G criteria
+#   M = X'X  (unnormalized is fine for ranking/efficiency within same p)
+#   D = |M|^(1/p) (use eigen-based logdet to avoid det() under/overflow)
+#   A = trace(M^{-1})
+#   G = max f(z)' M^{-1} f(z) on region (Monte Carlo approximation)
+# -----------------------------
+compute_DAG <- function(design_points, region = c("cube","sphere"), g_n = 5000) {
+  region <- match.arg(region)
+
+  X <- build_X_quadratic(design_points)
+  p <- ncol(X)
+  M <- crossprod(X)
+
+  # rank check
+  if (qr(M)$rank < p) return(NULL)
+
+  # stable logdet and Minv
+  ev <- eigen(M, symmetric = TRUE, only.values = TRUE)$values
+  if (any(ev <= 0)) return(NULL)
+  logdetM <- sum(log(ev))
+  Dcrit <- exp(logdetM / p)
+
+  Minv <- solve(M)
+  Acrit <- sum(diag(Minv))
+
+  k <- ncol(design_points)
+
+  Z <- if (region == "cube") sample_cube(g_n, k) else sample_unit_ball(g_n, k)
+  colnames(Z) <- colnames(design_points)
+
+  FZ <- build_X_quadratic(Z)
+  vx <- rowSums((FZ %*% Minv) * FZ)
+  Gcrit <- max(vx)
+
+  list(Dcrit = Dcrit, Acrit = Acrit, Gcrit = Gcrit)
+}
+
+# ============================================================
+# RUN OBJECTIVE 1
+# ============================================================
+
+k_grid   <- 3:10
+families <- c("FCCD","RCCD","SCCD","OCCD")
+
+# Choose ONE setting (thesis-friendly baseline).
+# If you want to explore many nc/rf/ra combos, that becomes Objective 3/4 style work.
+nc   <- 5
+rf   <- 1
+ra   <- 1
+core <- "full"   # will auto fall back to fractional for k>5 inside make_ccd()
+
+g_n <- 10000     # Monte Carlo size for G (increase for more accuracy)
+
+meta_list <- list()
+res_list  <- list()
+ii <- 0
+
+for (k in k_grid) {
+  for (fam in families) {
+
+    out <- make_ccd(k = k, family = fam, nc = nc, rf = rf, ra = ra, core = core)
+    pts <- out$points
+    meta_list[[length(meta_list)+1]] <- out$meta
+
+    # Save design points (optional)
+    saveRDS(pts, file.path("obj1_data", paste0("design_", out$meta$DesignID, ".rds")))
+
+    # Criteria on cube + unit ball
+    crit_cube <- compute_DAG(pts, region = "cube",   g_n = g_n)
+    crit_ball <- compute_DAG(pts, region = "sphere", g_n = g_n)
+
+    if (is.null(crit_cube) || is.null(crit_ball)) next
+
+    ii <- ii + 1
+    res_list[[ii]] <- tibble(
+      DesignID = out$meta$DesignID,
+      k        = out$meta$k,
+      family   = out$meta$family,
+      core     = out$meta$core,
+      alpha    = out$meta$alpha,
+      N        = out$meta$N,
+      Nf       = out$meta$Nf,
+      Na       = out$meta$Na,
+      Nc       = out$meta$Nc,
+      Dcrit_cube   = crit_cube$Dcrit,
+      Acrit_cube   = crit_cube$Acrit,
+      Gcrit_cube   = crit_cube$Gcrit,
+      Dcrit_sphere = crit_ball$Dcrit,
+      Acrit_sphere = crit_ball$Acrit,
+      Gcrit_sphere = crit_ball$Gcrit
+    )
+  }
+}
+
+design_metadata_obj1 <- bind_rows(meta_list)
+criteria_obj1 <- bind_rows(res_list)
+
+# Save outputs
+write_csv(design_metadata_obj1, "obj1_results/design_metadata_objective1.csv")
+write_csv(criteria_obj1,         "obj1_results/criteria_DAG_objective1.csv")
+
+# Quick view
+print(criteria_obj1 %>% arrange(k, family))
+
+
+```

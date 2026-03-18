@@ -1,0 +1,963 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "2026-03-12"
+---
+
+```{r setup, include=FALSE}
+############################################################
+# CCD DESIGN EVALUATION
+# Families: FCCD, RCCD, SCCD
+# Dimensions: k = 3,...,10
+#
+# Criteria:
+#   D-optimality
+#   A-optimality
+#   G-optimality
+############################################################
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(FrF2)
+
+dir.create("data_generated", showWarnings = FALSE)
+dir.create("Tables", showWarnings = FALSE)
+dir.create("Figures", showWarnings = FALSE)
+
+set.seed(6)
+
+############################################################
+# CCD GENERATOR
+############################################################
+
+make_ccd <- function(k, family, nc, rf, ra){
+
+  alpha <- switch(as.character(family),
+                  "FCCD" = 1,
+                  "RCCD" = (2^k)^(1/4),
+                  "SCCD" = sqrt(k))
+
+  if(k <= 6){
+    fac <- as.data.frame(FrF2(nruns = 2^k, nfactors = k))
+  } else {
+    fac <- as.data.frame(FrF2(nruns = 32, nfactors = k))
+  }
+
+  fac <- fac[,1:k]
+  colnames(fac) <- paste0("x",1:k)
+
+  fac <- mutate_all(fac, ~ifelse(.==1,1,-1))
+  fac_rep <- fac[rep(seq_len(nrow(fac)), rf),]
+
+  ax <- matrix(0,2*k,k)
+
+  for(j in 1:k){
+    ax[2*j-1,j] <- alpha
+    ax[2*j,j]   <- -alpha
+  }
+
+  ax <- as.data.frame(ax)
+  colnames(ax) <- paste0("x",1:k)
+
+  ax_rep <- ax[rep(seq_len(nrow(ax)), ra),]
+
+  cen <- as.data.frame(matrix(0,nc,k))
+  colnames(cen) <- paste0("x",1:k)
+
+  design_points <- bind_rows(fac_rep, ax_rep, cen)
+
+  DesignID <- paste0(family,"_k",k,"_nc",nc,"_rf",rf,"_ra",ra)
+
+  meta <- tibble(
+    DesignID = DesignID,
+    k = k,
+    family = family,
+    nc = nc,
+    rf = rf,
+    ra = ra,
+    alpha = alpha,
+    N = nrow(design_points)
+  )
+
+  list(points = design_points, meta = meta)
+}
+
+############################################################
+# BUILD QUADRATIC MODEL MATRIX
+############################################################
+
+build_X_quadratic <- function(df){
+
+  vars <- names(df)
+
+  form <- as.formula(
+    paste0("~ ",
+           paste(vars,collapse="+"),
+           " + ",
+           paste0("I(",vars,"^2)",collapse="+"),
+           " + (",
+           paste(vars,collapse="+"),
+           ")^2")
+  )
+
+  model.matrix(form,data=df)
+}
+
+############################################################
+# COMPUTE D, A, G CRITERIA
+############################################################
+
+compute_ADG <- function(design_points, g_n = 5000){
+
+  X <- build_X_quadratic(design_points)
+
+  p <- ncol(X)
+  M <- crossprod(X)
+
+  if(qr(M)$rank < p) return(NULL)
+
+  Minv <- solve(M)
+
+  Dcritical <- det(M)^(1/p)
+
+  Acritical <- sum(diag(Minv))
+
+  k <- ncol(design_points)
+
+  Z <- matrix(runif(g_n*k,-1,1),ncol=k)
+  colnames(Z) <- colnames(design_points)
+  Z <- as.data.frame(Z)
+
+  FZ <- build_X_quadratic(Z)
+
+  Gcritical <- max(rowSums((FZ %*% Minv) * FZ))
+
+  list(
+    Dcritical = Dcritical,
+    Acritical = Acritical,
+    Gcritical = Gcritical
+  )
+}
+
+############################################################
+# PARAMETER GRID
+############################################################
+
+k_grid   <- 3:10
+families <- c("FCCD","RCCD","SCCD")
+nc_grid  <- c(1,3,5,7,10)
+rf_grid  <- c(1,2,3)
+ra_grid  <- c(1,2,3)
+
+grid <- expand.grid(
+  k = k_grid,
+  family = families,
+  nc = nc_grid,
+  rf = rf_grid,
+  ra = ra_grid,
+  stringsAsFactors = FALSE
+)
+
+############################################################
+# GENERATE DESIGNS
+############################################################
+
+meta_list <- vector("list", nrow(grid))
+
+for(i in seq_len(nrow(grid))){
+
+  row <- grid[i,]
+
+  out <- make_ccd(row$k,row$family,row$nc,row$rf,row$ra)
+
+  meta_list[[i]] <- out$meta
+
+  saveRDS(
+    out$points,
+    file.path("data_generated",
+              paste0("design_",out$meta$DesignID,".rds"))
+  )
+}
+
+design_metadata <- bind_rows(meta_list)
+
+write_csv(design_metadata,
+          "data_generated/design_metadata.csv")
+
+############################################################
+# COMPUTE RAW CRITERIA
+############################################################
+
+meta <- read_csv("data_generated/design_metadata.csv")
+
+out_list <- vector("list", nrow(meta))
+
+for(i in seq_len(nrow(meta))){
+
+  id <- meta$DesignID[i]
+
+  pts <- readRDS(file.path("data_generated",
+                           paste0("design_",id,".rds")))
+
+  crit <- compute_ADG(pts)
+
+  if(is.null(crit)) next
+
+  out_list[[i]] <- tibble(
+    DesignID = id,
+    Dcritical = crit$Dcritical,
+    Acritical = crit$Acritical,
+    Gcritical = crit$Gcritical
+  )
+}
+
+mycriteria_raw <- bind_rows(out_list)
+
+write_csv(mycriteria_raw,
+          "data_generated/mycriteria_raw.csv")
+
+############################################################
+# CONVERT TO EFFICIENCIES
+############################################################
+
+df <- meta %>% inner_join(mycriteria_raw, by="DesignID")
+
+mycriteria_eff <- df %>%
+  group_by(k) %>%
+  mutate(
+    Defficiency = Dcritical / max(Dcritical),
+    Aefficiency = min(Acritical) / Acritical,
+    Gefficiency = min(Gcritical) / Gcritical
+  ) %>%
+  ungroup()
+
+write_csv(mycriteria_eff,
+          "data_generated/mycriteria_eff.csv")
+
+############################################################
+# MEAN EFFICIENCY BY k AND FAMILY
+############################################################
+
+tab_mean <- mycriteria_eff %>%
+  group_by(k,family) %>%
+  summarise(
+    meanD = mean(Defficiency,na.rm=TRUE),
+    meanA = mean(Aefficiency,na.rm=TRUE),
+    meanG = mean(Gefficiency,na.rm=TRUE),
+    n = sum(!is.na(Gefficiency)),
+    .groups="drop"
+  )
+
+write_csv(tab_mean,
+          "Tables/mean_eff_by_k_family.csv")
+
+############################################################
+# PLOTS
+############################################################
+
+plot_eff <- function(dat,ycol,ylab,outfile){
+
+  p <- ggplot(dat,
+              aes(x=k,
+                  y=.data[[ycol]],
+                  color=family,
+                  linetype=family,
+                  shape=family,
+                  group=family))+
+    geom_line(linewidth=1.1)+
+    geom_point(size=3)+
+    labs(
+      x="Number of factors (k)",
+      y=ylab,
+      color="CCD family"
+    )+
+    theme_minimal(base_size=14)
+
+  ggsave(outfile,p,width=8,height=5)
+
+  p
+}
+
+############################################################
+# G-EFFICIENCY
+############################################################
+
+pG <- plot_eff(tab_mean,
+               "meanG",
+               "Mean G-efficiency",
+               "Figures/mean_Geff_vs_k.png")
+
+############################################################
+# D-EFFICIENCY
+############################################################
+
+pD <- plot_eff(tab_mean,
+               "meanD",
+               "Mean D-efficiency",
+               "Figures/mean_Deff_vs_k.png")
+
+############################################################
+# A-EFFICIENCY
+############################################################
+
+pA <- plot_eff(tab_mean,
+               "meanA",
+               "Mean A-efficiency",
+               "Figures/mean_Aeff_vs_k.png")
+
+pG
+pD
+pA
+```
+
+```{r}
+############################################################
+# REGULARISED + SCALED REGULARISED CCD ANALYSIS
+# k = 3,...,10
+############################################################
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+set.seed(6)
+lambda <- 0.01
+G_N <- 5000
+
+############################################################
+# REGULARISED ADG
+############################################################
+
+compute_ADG_reg <- function(design_points, lambda = 0.01, g_n = 5000){
+
+X <- build_X_quadratic(design_points)
+
+p <- ncol(X)
+
+M <- crossprod(X)
+
+Mlam <- M + lambda * diag(p)
+
+Minv <- solve(Mlam)
+
+Dcrit <- det(Mlam)^(1/p)
+
+Acrit <- sum(diag(Minv))
+
+k <- ncol(design_points)
+
+Z <- matrix(runif(g_n*k,-1,1),ncol=k)
+colnames(Z) <- colnames(design_points)
+Z <- as.data.frame(Z)
+
+FZ <- build_X_quadratic(Z)
+
+Gcrit <- max(rowSums((FZ %*% Minv) * FZ))
+
+list(
+Dcrit = Dcrit,
+Acrit = Acrit,
+Gcrit = Gcrit
+)
+
+}
+
+############################################################
+# SCALED REGULARISED ADG (CORRECT VERSION)
+############################################################
+
+compute_ADG_scaled <- function(design_points, lambda0 = 0.01, g_n = 5000){
+
+X <- build_X_quadratic(design_points)
+
+p <- ncol(X)
+
+M <- crossprod(X)
+
+# scaled lambda from paper
+lambda_eff <- lambda0 * (sum(diag(M)) / p)
+
+Mlam <- M + lambda_eff * diag(p)
+
+Minv <- solve(Mlam)
+
+Dcrit <- det(Mlam)^(1/p)
+
+Acrit <- sum(diag(Minv))
+
+k <- ncol(design_points)
+
+Z <- matrix(runif(g_n*k,-1,1),ncol=k)
+colnames(Z) <- colnames(design_points)
+Z <- as.data.frame(Z)
+
+FZ <- build_X_quadratic(Z)
+
+Gcrit <- max(rowSums((FZ %*% Minv) * FZ))
+
+list(
+Dcrit = Dcrit,
+Acrit = Acrit,
+Gcrit = Gcrit
+)
+
+}
+
+############################################################
+# COMPUTE CRITERIA FOR ALL DESIGNS
+############################################################
+
+meta <- read_csv("data_generated/design_metadata.csv")
+
+out_list <- vector("list", nrow(meta))
+
+for(i in seq_len(nrow(meta))){
+
+id <- meta$DesignID[i]
+
+pts <- readRDS(file.path(
+"data_generated",
+paste0("design_",id,".rds")
+))
+
+crit_reg <- compute_ADG_reg(pts,lambda,G_N)
+
+crit_scaled <- compute_ADG_scaled(pts,lambda,G_N)
+
+out_list[[i]] <- tibble(
+DesignID = id,
+
+D_reg = crit_reg$Dcrit,
+A_reg = crit_reg$Acrit,
+G_reg = crit_reg$Gcrit,
+
+D_scaled = crit_scaled$Dcrit,
+A_scaled = crit_scaled$Acrit,
+G_scaled = crit_scaled$Gcrit
+)
+
+}
+
+mycriteria_raw_reg <- bind_rows(out_list)
+
+write_csv(
+mycriteria_raw_reg,
+"data_generated/mycriteria_raw_reg_scaled.csv"
+)
+
+############################################################
+# CONVERT TO EFFICIENCIES
+############################################################
+
+df <- meta %>%
+inner_join(mycriteria_raw_reg,by="DesignID")
+
+mycriteria_eff_reg <- df %>%
+group_by(k) %>%
+mutate(
+
+Deff_reg = D_reg / max(D_reg,na.rm=TRUE),
+Aeff_reg = min(A_reg,na.rm=TRUE) / A_reg,
+Geff_reg = min(G_reg,na.rm=TRUE) / G_reg,
+
+Deff_scaled = D_scaled / max(D_scaled,na.rm=TRUE),
+Aeff_scaled = min(A_scaled,na.rm=TRUE) / A_scaled,
+Geff_scaled = min(G_scaled,na.rm=TRUE) / G_scaled
+
+) %>%
+ungroup()
+
+write_csv(
+mycriteria_eff_reg,
+"data_generated/mycriteria_eff_reg_scaled.csv"
+)
+
+############################################################
+# MEAN EFFICIENCY BY k AND FAMILY
+############################################################
+
+tab_mean <- mycriteria_eff_reg %>%
+group_by(k,family) %>%
+summarise(
+
+meanD_reg = mean(Deff_reg,na.rm=TRUE),
+meanA_reg = mean(Aeff_reg,na.rm=TRUE),
+meanG_reg = mean(Geff_reg,na.rm=TRUE),
+
+meanD_scaled = mean(Deff_scaled,na.rm=TRUE),
+meanA_scaled = mean(Aeff_scaled,na.rm=TRUE),
+meanG_scaled = mean(Geff_scaled,na.rm=TRUE),
+
+.groups="drop"
+)
+
+write_csv(
+tab_mean,
+"Tables/mean_eff_reg_scaled_k3to10.csv"
+)
+
+############################################################
+# PLOT FUNCTION
+############################################################
+
+plot_eff <- function(dat,ycol,ylab,outfile){
+
+p <- ggplot(dat,
+aes(x=k,
+y=.data[[ycol]],
+color=family,
+linetype=family,
+shape=family,
+group=family))+
+geom_line(linewidth=1.1)+
+geom_point(size=3)+
+labs(
+x="Number of factors (k)",
+y=ylab,
+color="CCD family"
+)+
+theme_minimal(base_size=14)
+
+ggsave(outfile,p,width=8,height=5)
+
+p
+
+}
+
+############################################################
+# REGULARISED PLOTS
+############################################################
+
+plot_eff(
+tab_mean,
+"meanG_reg",
+"Mean G-efficiency (Regularised)",
+"Figures/G_regularised_k3to10.png"
+)
+
+plot_eff(
+tab_mean,
+"meanD_reg",
+"Mean D-efficiency (Regularised)",
+"Figures/D_regularised_k3to10.png"
+)
+
+plot_eff(
+tab_mean,
+"meanA_reg",
+"Mean A-efficiency (Regularised)",
+"Figures/A_regularised_k3to10.png"
+)
+
+############################################################
+# SCALED REGULARISED PLOTS
+############################################################
+
+plot_eff(
+tab_mean,
+"meanG_scaled",
+"Mean G-efficiency (Scaled Regularised)",
+"Figures/G_scaled_k3to10.png"
+)
+
+plot_eff(
+tab_mean,
+"meanD_scaled",
+"Mean D-efficiency (Scaled Regularised)",
+"Figures/D_scaled_k3to10.png"
+)
+
+plot_eff(
+tab_mean,
+"meanA_scaled",
+"Mean A-efficiency (Scaled Regularised)",
+"Figures/A_scaled_k3to10.png"
+)
+```
+
+```{r}
+############################################################
+# SCALED REGULARISED SPECTRAL ANALYSIS
+############################################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+
+set.seed(6)
+
+lambda0 <- 0.01
+
+spec_list <- vector("list", nrow(meta))
+
+for(i in seq_len(nrow(meta))){
+
+id <- meta$DesignID[i]
+
+pts <- readRDS(file.path(
+"data_generated",
+paste0("design_", id, ".rds")
+))
+
+X <- build_X_quadratic(pts)
+
+p <- ncol(X)
+
+M <- crossprod(X)
+
+# scaled regularisation parameter
+lambda_eff <- lambda0 * (sum(diag(M)) / p)
+
+Mlam <- M + lambda_eff * diag(p)
+
+ev <- eigen(Mlam, symmetric = TRUE, only.values = TRUE)$values
+
+ev <- ev[ev > 0]
+
+q <- quantile(ev, probs = c(0.10,0.50,0.90))
+
+spec_list[[i]] <- tibble(
+
+DesignID = id,
+
+eig_q10 = q[1],
+eig_q50 = q[2],
+eig_q90 = q[3],
+
+min_eig = min(ev),
+max_eig = max(ev),
+
+cond_number = max(ev) / min(ev),
+
+log_determinant = sum(log(ev))
+
+)
+
+}
+
+spec_df <- bind_rows(spec_list)
+
+df_spec <- meta %>%
+left_join(spec_df, by="DesignID")
+
+############################################################
+# Eigenvalue distribution summary
+############################################################
+
+eig_summary <- df_spec %>%
+group_by(k, family) %>%
+summarise(
+
+mean_q10 = mean(eig_q10),
+mean_q50 = mean(eig_q50),
+mean_q90 = mean(eig_q90),
+
+mean_min_eig = mean(min_eig),
+mean_max_eig = mean(max_eig),
+
+.groups="drop"
+)
+
+write_csv(
+eig_summary,
+"Tables/eigenvalue_distribution_scaled.csv"
+)
+
+eig_summary
+
+############################################################
+# Eigenvalue distribution plot
+############################################################
+
+eig_long <- eig_summary %>%
+pivot_longer(
+cols=c(mean_q10, mean_q50, mean_q90),
+names_to="quantile",
+values_to="value"
+)
+
+p_eig <- ggplot(
+eig_long,
+aes(x=k, y=value, color=family, group=family)
+)+
+geom_line(linewidth=1.1)+
+geom_point(size=3)+
+facet_wrap(~quantile, scales="free_y")+
+labs(
+x="Number of factors (k)",
+y="Eigenvalue",
+title="Eigenvalue Distribution (Scaled Regularised)"
+)+
+theme_minimal(base_size=14)
+
+ggsave(
+"Figures/eigenvalue_distribution_scaled.png",
+p_eig,
+width=10,
+height=6
+)
+
+p_eig
+
+############################################################
+# Condition number growth
+############################################################
+
+cond_table <- df_spec %>%
+group_by(k, family) %>%
+summarise(
+
+mean_condition = mean(cond_number),
+
+.groups="drop"
+)
+
+write_csv(
+cond_table,
+"Tables/condition_number_growth_scaled.csv"
+)
+
+cond_table
+
+############################################################
+# Condition number growth plot
+############################################################
+
+p_cond <- ggplot(
+cond_table,
+aes(x=k, y=mean_condition, color=family, group=family)
+)+
+geom_line(linewidth=1.1)+
+geom_point(size=3)+
+labs(
+x="Number of factors (k)",
+y="Condition number",
+title="Condition Number Growth (Scaled Regularised)"
+)+
+theme_minimal(base_size=14)
+
+ggsave(
+"Figures/condition_number_growth_scaled.png",
+p_cond,
+width=8,
+height=5
+)
+
+p_cond
+
+############################################################
+# Log Determinant growth
+############################################################
+
+logdet_table <- df_spec %>%
+group_by(k, family) %>%
+summarise(
+
+mean_logdet = mean(log_determinant),
+
+.groups="drop"
+)
+
+write_csv(
+logdet_table,
+"Tables/log_determinant_growth_scaled.csv"
+)
+
+logdet_table
+
+############################################################
+# Log Determinant growth plot
+############################################################
+
+p_logdet <- ggplot(
+logdet_table,
+aes(x=k, y=mean_logdet, color=family, group=family)
+)+
+geom_line(linewidth=1.1)+
+geom_point(size=3)+
+labs(
+x="Number of factors (k)",
+y="Log Determinant",
+title="Log Determinant Growth (Scaled Regularised)"
+)+
+theme_minimal(base_size=14)
+
+ggsave(
+"Figures/log_determinant_growth_scaled.png",
+p_logdet,
+width=8,
+height=5
+)
+
+p_logdet
+```
+
+```{r}
+############################################################
+# CROSS-DIMENSIONAL STABILITY AND SCALING EXPONENTS
+# (Scaled Regularised Efficiencies)
+############################################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+
+# Load scaled regularised efficiencies
+df_eff <- read_csv(
+"data_generated/mycriteria_eff_reg_scaled.csv"
+)
+
+############################################################
+# Mean efficiency by k and family
+############################################################
+
+mean_eff <- df_eff %>%
+group_by(k, family) %>%
+summarise(
+
+meanD = mean(Deff_scaled, na.rm=TRUE),
+meanA = mean(Aeff_scaled, na.rm=TRUE),
+meanG = mean(Geff_scaled, na.rm=TRUE),
+
+.groups="drop"
+)
+
+write_csv(
+mean_eff,
+"Tables/mean_efficiency_scaled_by_k_family.csv"
+)
+
+############################################################
+# Convert to long format
+############################################################
+
+eff_long <- mean_eff %>%
+pivot_longer(
+cols = c(meanD, meanA, meanG),
+names_to = "criterion",
+values_to = "mean_eff"
+) %>%
+mutate(
+criterion = recode(
+criterion,
+meanD = "D",
+meanA = "A",
+meanG = "G"
+)
+)
+
+############################################################
+# SCALING EXPONENTS
+# log(mean_eff) = beta0 + beta1 log(k)
+############################################################
+
+scaling_exponents <- eff_long %>%
+filter(mean_eff > 0) %>%
+mutate(
+log_eff = log(mean_eff),
+log_k = log(k)
+) %>%
+group_by(family, criterion) %>%
+do({
+
+fit <- lm(log_eff ~ log_k, data=.)
+
+tibble(
+beta0 = coef(fit)[1],
+beta1 = coef(fit)[2],
+R2 = summary(fit)$r.squared
+)
+
+}) %>%
+ungroup()
+
+write_csv(
+scaling_exponents,
+"Tables/scaling_exponents_scaled.csv"
+)
+
+scaling_exponents
+
+############################################################
+# Scaling exponent plot
+############################################################
+
+p_beta <- ggplot(
+scaling_exponents,
+aes(x=family, y=beta1, fill=family)
+)+
+geom_col(width=.6)+
+facet_wrap(~criterion, scales="free_y")+
+labs(
+x="CCD Family",
+y="Scaling exponent (beta1)",
+title="Scaling Exponents of Mean Efficiency (Scaled Regularised)"
+)+
+theme_minimal(base_size=14)+
+theme(legend.position="none")
+
+ggsave(
+"Figures/scaling_exponents_scaled.png",
+p_beta,
+width=10,
+height=5
+)
+
+p_beta
+
+############################################################
+# CROSS-DIMENSIONAL VARIANCE (CDS)
+############################################################
+
+cds_variance <- eff_long %>%
+group_by(family, criterion) %>%
+summarise(
+
+variance = var(mean_eff, na.rm=TRUE),
+sd = sd(mean_eff, na.rm=TRUE),
+range = max(mean_eff) - min(mean_eff),
+
+.groups="drop"
+)
+
+write_csv(
+cds_variance,
+"Tables/cross_dimensional_variance_scaled.csv"
+)
+
+cds_variance
+
+############################################################
+# CDS variance plot
+############################################################
+
+p_cds <- ggplot(
+cds_variance,
+aes(x=criterion, y=family, fill=variance)
+)+
+geom_tile()+
+geom_text(aes(label=round(variance,4)))+
+scale_fill_gradient(low="lightblue", high="darkblue")+
+labs(
+x="Efficiency Criterion",
+y="CCD Family",
+fill="Variance",
+title="Cross-Dimensional Variance of Efficiency (Scaled Regularised)"
+)+
+theme_minimal(base_size=14)
+
+ggsave(
+"Figures/cross_dimensional_variance_scaled.png",
+
+p_cds,
+width=8,
+height=5
+)
+
+p_cds
+```
+

@@ -1,0 +1,1578 @@
+---
+title: |
+  | APPENDIX A
+  | R Code for Cross-Dimensional Stability and Spectral Characteristics
+  | of Central Composite Designs Under Alphabetic Optimality Criteria
+author: "Ngonadi, Lilian Oluebube (2016556004F)"
+date: "March 2026"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    highlight: tango
+    latex_engine: xelatex
+    keep_tex: false
+geometry: "margin=2.54cm"
+fontsize: 11pt
+header-includes:
+  - \usepackage{fancyhdr}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \pagestyle{fancy}
+  - \fancyhf{}
+  - \fancyhead[L]{\small PhD Appendix: R Code}
+  - \fancyhead[R]{\small Ngonadi (2026)}
+  - \fancyfoot[C]{\thepage}
+  - \renewcommand{\headrulewidth}{0.4pt}
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,       # show code in appendix
+  eval      = FALSE,      # do NOT re-run (results already in main text)
+  message   = FALSE,
+  warning   = FALSE,
+  comment   = "#>",
+  tidy      = FALSE,
+  size      = "small"     # slightly smaller font for code blocks
+)
+```
+
+\newpage
+
+# Preamble: Package Loading and Directory Setup
+
+All packages used in this study are loaded here. Output directories are
+created if they do not already exist. The random seed is fixed at 6
+throughout to ensure full reproducibility.
+
+```{r A-packages}
+# ── Core data manipulation and visualisation ──────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(broom)
+
+# ── Experimental design ───────────────────────────────────────────────────────
+library(FrF2)           # factorial design generation
+
+# ── Machine learning (Objective 4) ───────────────────────────────────────────
+library(ranger)         # Random Forest
+library(vip)            # variable importance plots
+library(glmnet)         # Ridge, Lasso, Elastic Net
+library(e1071)          # Support Vector Regression
+library(xgboost)        # Gradient Boosting
+library(FNN)            # K-Nearest Neighbours regression
+
+# ── Machine learning (Objective 5 — tidymodels framework) ────────────────────
+library(rsample)        # train/test splitting and CV folds
+library(recipes)        # pre-processing recipes
+library(parsnip)        # unified model interface
+library(workflows)      # model + recipe workflows
+library(tune)           # hyperparameter tuning
+library(yardstick)      # model evaluation metrics
+library(dials)          # tuning parameter grids
+
+# ── Output directories ────────────────────────────────────────────────────────
+dirs <- c(
+  "data_generated", "data_generated2",
+  "results_tables",  "results_tables1", "results_tables2", "results_tables4",
+  "results_figures", "results_figures1", "results_figures2", "results_figures4",
+  "Tables2", "Figures2"
+)
+invisible(lapply(dirs, dir.create, showWarnings = FALSE, recursive = TRUE))
+
+set.seed(6)
+```
+
+\newpage
+
+# Shared Helper Functions
+
+These functions are defined once and used throughout all objectives.
+
+## CCD Design Generator (`make_ccd`)
+
+Constructs a Central Composite Design for a given family (FCCD, RCCD, or
+SCCD), number of factors $k$, center-point count $n_c$, and replication
+counts $r_f$ and $r_\alpha$.  
+For $k \leq 5$ a full $2^k$ factorial core is used; for $k \geq 6$ the
+factorial run count is fixed at 32 to simulate a realistic budget
+constraint (see Section 3.2.5 of the main text).
+
+```{r fn-make-ccd}
+make_ccd <- function(k, family, nc, rf, ra) {
+
+  # ── Axial distance by design family ─────────────────────────────────────────
+  alpha <- switch(family,
+    FCCD = 1,
+    RCCD = (2^k)^(1/4),   # rotatability condition
+    SCCD = sqrt(k),        # spherical condition
+    stop("Unknown family: must be one of FCCD, RCCD, SCCD")
+  )
+
+  # ── Factorial core ───────────────────────────────────────────────────────────
+  # k <= 5: full 2^k factorial
+  # k >= 6: fixed at 32 runs (budget constraint)
+  nf_runs <- if (k <= 5) 2^k else 32L
+  fac <- as.data.frame(FrF2::FrF2(nruns = nf_runs, nfactors = k))
+  fac <- fac[, 1:k, drop = FALSE]
+  colnames(fac) <- paste0("x", seq_len(k))
+  fac <- dplyr::mutate_all(fac, ~ ifelse(. == 1, 1, -1))
+
+  # Replicate factorial points rf times
+  fac_rep <- fac[rep(seq_len(nrow(fac)), times = rf), , drop = FALSE]
+
+  # ── Axial (star) points: 2k points at ±alpha along each axis ────────────────
+  ax <- matrix(0, nrow = 2 * k, ncol = k)
+  for (j in seq_len(k)) {
+    ax[2 * j - 1, j] <-  alpha
+    ax[2 * j,     j] <- -alpha
+  }
+  ax <- as.data.frame(ax)
+  colnames(ax) <- paste0("x", seq_len(k))
+
+  # Replicate axial points ra times
+  ax_rep <- ax[rep(seq_len(nrow(ax)), times = ra), , drop = FALSE]
+
+  # ── Center points ────────────────────────────────────────────────────────────
+  cen <- as.data.frame(matrix(0, nrow = nc, ncol = k))
+  colnames(cen) <- paste0("x", seq_len(k))
+
+  # ── Combine all components ───────────────────────────────────────────────────
+  design_points <- dplyr::bind_rows(fac_rep, ax_rep, cen)
+
+  # ── Unique design identifier ─────────────────────────────────────────────────
+  DesignID <- paste0(family, "_k", k, "_nc", nc,
+                     "_rf", rf, "_ra", ra, "_full")
+
+  # ── Metadata tibble ──────────────────────────────────────────────────────────
+  meta <- tibble::tibble(
+    DesignID = DesignID,
+    k        = k,
+    family   = family,
+    nc       = nc,
+    rf       = rf,
+    ra       = ra,
+    core     = "full",
+    alpha    = alpha,
+    N        = nrow(design_points),
+    Nf       = nrow(fac_rep),
+    Na       = nrow(ax_rep),
+    Nc       = nrow(cen)
+  )
+
+  list(points = design_points, meta = meta)
+}
+```
+
+## Quadratic Model Matrix Builder (`build_X_quadratic`)
+
+Constructs the full second-order response surface model matrix
+$\mathbf{X}$ with intercept, $k$ linear terms, $k$ pure quadratic terms,
+and $k(k-1)/2$ two-factor interaction terms.
+
+```{r fn-build-X}
+build_X_quadratic <- function(df) {
+  vars <- names(df)
+  form <- as.formula(paste0(
+    "~ ",
+    paste(vars, collapse = " + "),
+    " + ",
+    paste0("I(", vars, "^2)", collapse = " + "),
+    " + (",
+    paste(vars, collapse = " + "),
+    ")^2"
+  ))
+  model.matrix(form, data = df)
+}
+```
+
+## Log-Determinant via Cholesky Decomposition (`logdet_pd`)
+
+Computes $\log|M_\lambda|$ numerically stably using the Cholesky factor:
+$\log|M_\lambda| = 2 \sum_j \log R_{jj}$.
+
+```{r fn-logdet}
+logdet_pd <- function(Mpd) {
+  R <- chol(Mpd)
+  2 * sum(log(diag(R)))
+}
+```
+
+## Unregularised Optimality Criteria (`compute_ADG`)
+
+Used for $k \leq 6$ where $M = X^\prime X$ is non-singular.  
+G-efficiency is approximated via Monte Carlo with `g_n = 5000` random
+points drawn from either the cube $[-1,1]^k$ or the sphere of radius
+$\sqrt{k}$.
+
+```{r fn-compute-ADG}
+compute_ADG <- function(design_points,
+                        region = c("cube", "sphere"),
+                        g_n    = 5000) {
+  region <- match.arg(region)
+
+  X <- build_X_quadratic(design_points)
+  p <- ncol(X)
+  M <- crossprod(X)
+
+  # Return NULL for rank-deficient matrices (excluded from analysis)
+  if (qr(M)$rank < p) return(NULL)
+  Minv <- solve(M)
+
+  Dcritical <- det(M)^(1 / p)
+  Acritical <- sum(diag(Minv))
+
+  k <- ncol(design_points)
+
+  # Monte Carlo sample from the experimental region
+  if (region == "cube") {
+    Z <- matrix(runif(g_n * k, -1, 1), ncol = k)
+  } else {
+    # Uniform sample inside sphere of radius sqrt(k)
+    Z <- matrix(rnorm(g_n * k), ncol = k)
+    Z <- Z / sqrt(rowSums(Z^2))            # project to unit sphere
+    r <- runif(g_n)^(1 / k) * sqrt(k)     # radial scaling
+    Z <- Z * r
+  }
+
+  colnames(Z) <- colnames(design_points)
+  Z           <- as.data.frame(Z)
+  FZ          <- build_X_quadratic(Z)
+
+  # Maximum scaled prediction variance
+  Gcritical <- max(rowSums((FZ %*% Minv) * FZ))
+
+  list(Dcritical = Dcritical, Acritical = Acritical, Gcritical = Gcritical)
+}
+```
+
+## Regularised Optimality Criteria (`compute_ADG_reg`)
+
+Used for all $k = 3, \ldots, 10$ with $M_\lambda = X^\prime X + \lambda I$.
+The Cholesky decomposition is used for both the log-determinant and the
+matrix inverse to ensure numerical stability.
+
+```{r fn-compute-ADG-reg}
+compute_ADG_reg <- function(design_points,
+                            region = c("cube", "sphere"),
+                            g_n    = 5000,
+                            lambda = 1e-2) {
+  region <- match.arg(region)
+
+  X <- build_X_quadratic(design_points)
+  p <- ncol(X)
+  M <- crossprod(X)
+
+  # Ridge-regularised information matrix
+  Mlam <- M + diag(lambda, p)
+
+  # Cholesky factorisation (returns NULL if not positive definite)
+  R <- tryCatch(chol(Mlam), error = function(e) NULL)
+  if (is.null(R)) return(NULL)
+
+  Mlam_inv <- chol2inv(R)
+
+  # Regularised criteria
+  Dcrit <- exp(logdet_pd(Mlam) / p)
+  Acrit <- sum(diag(Mlam_inv))
+
+  k <- ncol(design_points)
+
+  # Monte Carlo sample
+  if (region == "cube") {
+    Z <- matrix(runif(g_n * k, -1, 1), ncol = k)
+  } else {
+    Z <- matrix(rnorm(g_n * k), ncol = k)
+    Z <- Z / sqrt(rowSums(Z^2))
+    r <- runif(g_n)^(1 / k) * sqrt(k)
+    Z <- Z * r
+  }
+
+  colnames(Z) <- colnames(design_points)
+  Z           <- as.data.frame(Z)
+  FZ          <- build_X_quadratic(Z)
+
+  vx    <- rowSums((FZ %*% Mlam_inv) * FZ)
+  Gcrit <- max(vx)
+
+  list(Dcrit = Dcrit, Acrit = Acrit, Gcrit = Gcrit)
+}
+```
+
+## Machine Learning Helper Functions
+
+```{r fn-ml-helpers}
+# ── Performance metrics (RMSE and R-squared) ──────────────────────────────────
+reg_metrics <- function(y_true, y_pred) {
+  rmse <- sqrt(mean((y_pred - y_true)^2))
+  r2   <- 1 - sum((y_pred - y_true)^2) /
+              sum((y_true - mean(y_true))^2)
+  c(rmse = rmse, r2 = r2)
+}
+
+# ── Observed-vs-predicted scatter plot ───────────────────────────────────────
+save_obs_pred_plot <- function(y_true, y_pred, model_name, outdir) {
+  p <- ggplot(
+    data.frame(Observed = y_true, Predicted = y_pred),
+    aes(x = Observed, y = Predicted)
+  ) +
+    geom_point(alpha = 0.45, size = 1.5) +
+    geom_abline(slope = 1, intercept = 0,
+                colour = "red", linetype = "dashed") +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = paste("Observed vs Predicted:", model_name),
+      x     = "Observed efficiency",
+      y     = "Predicted efficiency"
+    )
+  ggsave(
+    file.path(outdir, paste0("obs_vs_pred_", model_name, ".png")),
+    p, width = 7, height = 5
+  )
+  invisible(p)
+}
+
+# ── XGBoost importance extraction + normalisation ─────────────────────────────
+get_xgb_importance <- function(model, response_label) {
+  xgb.importance(model = model) %>%
+    transmute(
+      response  = response_label,
+      Feature   = Feature,
+      Gain      = ifelse(is.na(Gain), 0, Gain)
+    ) %>%
+    mutate(Gain_norm = Gain / sum(Gain, na.rm = TRUE))
+}
+
+# ── Reorder factor levels within facets (for faceted importance plots) ────────
+reorder_within <- function(x, by, within, fun = mean, sep = "___") {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+
+scale_x_reordered <- function(..., sep = "___") {
+  ggplot2::scale_x_discrete(
+    labels = function(x) sub(paste0(sep, ".*$"), "", x), ...
+  )
+}
+```
+
+\newpage
+
+# Objective 1 (Unregularised): Evaluation for k = 3 to 6
+
+## Part A — Generate Designs and Metadata
+
+```{r obj1-unr-generate}
+k_grid   <- 3:6                           # unregularised: k <= 6 only
+families <- c("FCCD", "RCCD", "SCCD")
+nc_grid  <- c(1, 3, 5, 7, 10)
+rf_grid  <- c(1, 2, 3)
+ra_grid  <- c(1, 2, 3)
+
+grid_unr <- expand.grid(
+  k      = k_grid,
+  family = families,
+  nc     = nc_grid,
+  rf     = rf_grid,
+  ra     = ra_grid,
+  stringsAsFactors = FALSE
+)
+
+meta_list_unr <- vector("list", nrow(grid_unr))
+
+for (i in seq_len(nrow(grid_unr))) {
+  row <- grid_unr[i, ]
+  out <- make_ccd(row$k, row$family, row$nc, row$rf, row$ra)
+  meta_list_unr[[i]] <- out$meta
+  saveRDS(
+    out$points,
+    file.path("data_generated2",
+              paste0("design_", out$meta$DesignID, ".rds"))
+  )
+}
+
+design_metadata_unr <- dplyr::bind_rows(meta_list_unr)
+readr::write_csv(design_metadata_unr,
+                 "data_generated2/design_metadata_unr.csv")
+```
+
+## Part B — Compute Unregularised D-, A-, G-Criteria
+
+```{r obj1-unr-criteria}
+meta_unr <- readr::read_csv("data_generated2/design_metadata_unr.csv")
+out_list_unr <- vector("list", nrow(meta_unr))
+
+for (i in seq_len(nrow(meta_unr))) {
+  id  <- meta_unr$DesignID[i]
+  pts <- readRDS(file.path("data_generated2",
+                           paste0("design_", id, ".rds")))
+
+  crit_cube <- compute_ADG(pts, "cube",   g_n = 5000)
+  crit_sph  <- compute_ADG(pts, "sphere", g_n = 5000)
+
+  if (is.null(crit_cube) || is.null(crit_sph)) next
+
+  out_list_unr[[i]] <- tibble::tibble(
+    DesignID         = id,
+    Dcritical_cube   = crit_cube$Dcritical,
+    Acritical_cube   = crit_cube$Acritical,
+    Gcritical_cube   = crit_cube$Gcritical,
+    Dcritical_sphere = crit_sph$Dcritical,
+    Acritical_sphere = crit_sph$Acritical,
+    Gcritical_sphere = crit_sph$Gcritical
+  )
+}
+
+mycriteria_raw_unr <- dplyr::bind_rows(out_list_unr)
+readr::write_csv(mycriteria_raw_unr,
+                 "data_generated2/mycriteria_raw_unr.csv")
+```
+
+## Part C — Convert to Relative Efficiencies (Within Each k)
+
+Relative efficiencies are computed by normalising within each dimension $k$
+so that the best-performing design at each $k$ receives an efficiency of 1.
+
+```{r obj1-unr-efficiencies}
+df_unr <- meta_unr %>%
+  dplyr::inner_join(mycriteria_raw_unr, by = "DesignID")
+
+mycriteria_eff_unr <- df_unr %>%
+  dplyr::group_by(k) %>%
+  dplyr::mutate(
+    # D-efficiency: higher determinant is better
+    Defficiency_cube   = Dcritical_cube   / max(Dcritical_cube,   na.rm = TRUE),
+    Defficiency_sphere = Dcritical_sphere / max(Dcritical_sphere, na.rm = TRUE),
+    # A-efficiency: lower trace(M^-1) is better
+    Aefficiency_cube   = min(Acritical_cube,   na.rm = TRUE) / Acritical_cube,
+    Aefficiency_sphere = min(Acritical_sphere, na.rm = TRUE) / Acritical_sphere,
+    # G-efficiency: lower max prediction variance is better
+    Gefficiency_cube   = min(Gcritical_cube,   na.rm = TRUE) / Gcritical_cube,
+    Gefficiency_sphere = min(Gcritical_sphere, na.rm = TRUE) / Gcritical_sphere
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(mycriteria_eff_unr,
+                 "data_generated2/mycriteria_eff_unr.csv")
+```
+
+## Part D — Mean Efficiency Tables and Plots (k = 3 to 6)
+
+```{r obj1-unr-plots}
+tab_mean_unr <- mycriteria_eff_unr %>%
+  dplyr::group_by(k, family) %>%
+  dplyr::summarise(
+    meanD_cube   = mean(Defficiency_cube,   na.rm = TRUE),
+    meanA_cube   = mean(Aefficiency_cube,   na.rm = TRUE),
+    meanG_cube   = mean(Gefficiency_cube,   na.rm = TRUE),
+    meanD_sphere = mean(Defficiency_sphere, na.rm = TRUE),
+    meanA_sphere = mean(Aefficiency_sphere, na.rm = TRUE),
+    meanG_sphere = mean(Gefficiency_sphere, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_mean_unr,
+                 "Tables2/mean_eff_by_k_family_unr_k3to6.csv")
+
+# ── Plotting helper ──────────────────────────────────────────────────────────
+plot_eff_line <- function(dat, ycol, ylab, outfile) {
+  p <- ggplot(dat,
+    aes(x = k, y = .data[[ycol]],
+        colour = family, linetype = family, shape = family,
+        group  = family)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2.8) +
+    scale_x_continuous(breaks = unique(dat$k)) +
+    labs(x = "Number of factors (k)", y = ylab,
+         colour   = "CCD family",
+         linetype = "CCD family",
+         shape    = "CCD family") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "right",
+          legend.title = element_text(face = "bold"))
+  ggsave(outfile, p, width = 8, height = 5)
+  invisible(p)
+}
+
+# G-efficiency — main figures
+plot_eff_line(tab_mean_unr, "meanG_cube",
+  "Mean G-efficiency (cube, unregularised)",
+  "Figures2/unr_meanG_cube_k3to6.png")
+
+plot_eff_line(tab_mean_unr, "meanG_sphere",
+  "Mean G-efficiency (sphere, unregularised)",
+  "Figures2/unr_meanG_sphere_k3to6.png")
+
+# D-efficiency — support figures
+plot_eff_line(tab_mean_unr, "meanD_cube",
+  "Mean D-efficiency (cube, unregularised)",
+  "Figures2/unr_meanD_cube_k3to6.png")
+
+plot_eff_line(tab_mean_unr, "meanD_sphere",
+  "Mean D-efficiency (sphere, unregularised)",
+  "Figures2/unr_meanD_sphere_k3to6.png")
+
+# A-efficiency — support figures
+plot_eff_line(tab_mean_unr, "meanA_cube",
+  "Mean A-efficiency (cube, unregularised)",
+  "Figures2/unr_meanA_cube_k3to6.png")
+
+plot_eff_line(tab_mean_unr, "meanA_sphere",
+  "Mean A-efficiency (sphere, unregularised)",
+  "Figures2/unr_meanA_sphere_k3to6.png")
+
+# Combined G: cube vs sphere, faceted by family
+tab_G_long_unr <- tab_mean_unr %>%
+  tidyr::pivot_longer(cols = c(meanG_cube, meanG_sphere),
+                      names_to  = "region",
+                      values_to = "meanG") %>%
+  dplyr::mutate(region = dplyr::recode(region,
+                                       meanG_cube   = "Cube",
+                                       meanG_sphere = "Sphere"))
+
+pG_combined_unr <- ggplot(tab_G_long_unr,
+  aes(x = k, y = meanG,
+      group    = region,
+      colour   = region,
+      linetype = region,
+      shape    = region)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.8) +
+  facet_wrap(~family) +
+  scale_x_continuous(breaks = unique(tab_G_long_unr$k)) +
+  labs(x = "Number of factors (k)", y = "Mean G-efficiency",
+       colour = "Region", linetype = "Region", shape = "Region") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+ggsave("Figures2/unr_Geff_cube_vs_sphere_facets_k3to6.png",
+       pG_combined_unr, width = 10, height = 6)
+```
+
+\newpage
+
+# Objective 1 (Regularised): Evaluation for k = 3 to 10
+
+## Part A — Generate Designs and Metadata
+
+```{r obj1-reg-generate}
+k_grid_reg <- 3:10
+grid_reg   <- expand.grid(
+  k      = k_grid_reg,
+  family = c("FCCD", "RCCD", "SCCD"),
+  nc     = c(1, 3, 5, 7, 10),
+  rf     = c(1, 2, 3),
+  ra     = c(1, 2, 3),
+  stringsAsFactors = FALSE
+)
+
+meta_list_reg <- vector("list", nrow(grid_reg))
+
+for (i in seq_len(nrow(grid_reg))) {
+  row <- grid_reg[i, ]
+  out <- make_ccd(row$k, row$family, row$nc, row$rf, row$ra)
+  meta_list_reg[[i]] <- out$meta
+  saveRDS(
+    out$points,
+    file.path("data_generated",
+              paste0("design_", out$meta$DesignID, ".rds"))
+  )
+}
+
+design_metadata_reg <- dplyr::bind_rows(meta_list_reg)
+readr::write_csv(design_metadata_reg,
+                 "data_generated/design_metadata_reg.csv")
+```
+
+## Part B — Grid Search for Optimal Lambda
+
+A grid of nine candidate values $\lambda \in \{10^{-10}, \ldots, 10^{-2}\}$
+is evaluated. The value that maximises mean G-efficiency (averaged over
+both regions and all $k$) is selected as $\lambda^*$.
+
+```{r obj1-reg-lambda-search}
+lambda_grid <- 10^seq(-10, -2, by = 1)
+G_N         <- 5000
+
+meta_reg <- readr::read_csv("data_generated/design_metadata_reg.csv") %>%
+  dplyr::mutate(DesignID = stringr::str_trim(DesignID))
+
+raw_by_lam <- list()
+idx        <- 1L
+
+for (lam in lambda_grid) {
+  for (i in seq_len(nrow(meta_reg))) {
+    id    <- meta_reg$DesignID[i]
+    fpath <- file.path("data_generated", paste0("design_", id, ".rds"))
+    if (!file.exists(fpath)) next
+
+    pts       <- readRDS(fpath)
+    crit_cube <- compute_ADG_reg(pts, "cube",   g_n = G_N, lambda = lam)
+    crit_sph  <- compute_ADG_reg(pts, "sphere", g_n = G_N, lambda = lam)
+    if (is.null(crit_cube) || is.null(crit_sph)) next
+
+    raw_by_lam[[idx]] <- tibble::tibble(
+      DesignID         = id,
+      lambda           = lam,
+      Dcritical_cube   = crit_cube$Dcrit,
+      Acritical_cube   = crit_cube$Acrit,
+      Gcritical_cube   = crit_cube$Gcrit,
+      Dcritical_sphere = crit_sph$Dcrit,
+      Acritical_sphere = crit_sph$Acrit,
+      Gcritical_sphere = crit_sph$Gcrit
+    )
+    idx <- idx + 1L
+  }
+}
+
+mycriteria_raw_by_lambda <- dplyr::bind_rows(raw_by_lam)
+readr::write_csv(mycriteria_raw_by_lambda,
+                 "data_generated/mycriteria_raw_by_lambda.csv")
+```
+
+## Part C — Compute Relative Efficiencies Within (lambda, k)
+
+```{r obj1-reg-efficiencies}
+df_all_lam <- meta_reg %>%
+  dplyr::inner_join(mycriteria_raw_by_lambda, by = "DesignID")
+
+mycriteria_eff_by_lambda <- df_all_lam %>%
+  dplyr::group_by(lambda, k) %>%
+  dplyr::mutate(
+    Deff_cube   = Dcritical_cube   / max(Dcritical_cube,   na.rm = TRUE),
+    Aeff_cube   = min(Acritical_cube,   na.rm = TRUE) / Acritical_cube,
+    Geff_cube   = min(Gcritical_cube,   na.rm = TRUE) / Gcritical_cube,
+    Deff_sphere = Dcritical_sphere / max(Dcritical_sphere, na.rm = TRUE),
+    Aeff_sphere = min(Acritical_sphere, na.rm = TRUE) / Acritical_sphere,
+    Geff_sphere = min(Gcritical_sphere, na.rm = TRUE) / Gcritical_sphere
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(mycriteria_eff_by_lambda,
+                 "data_generated/mycriteria_eff_by_lambda.csv")
+```
+
+## Part D — Select Best Lambda
+
+```{r obj1-reg-best-lambda}
+lambda_summary <- mycriteria_eff_by_lambda %>%
+  dplyr::mutate(
+    G_overall = (Geff_cube + Geff_sphere) / 2,
+    D_overall = (Deff_cube + Deff_sphere) / 2,
+    A_overall = (Aeff_cube + Aeff_sphere) / 2
+  ) %>%
+  dplyr::group_by(lambda) %>%
+  dplyr::summarise(
+    meanG = mean(G_overall, na.rm = TRUE),
+    meanD = mean(D_overall, na.rm = TRUE),
+    meanA = mean(A_overall, na.rm = TRUE),
+    n     = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(meanG),
+                 dplyr::desc(meanD),
+                 dplyr::desc(meanA))
+
+readr::write_csv(lambda_summary,
+                 "data_generated/lambda_grid_summary.csv")
+
+# Best lambda (= 0.01 for this dataset)
+best_lambda <- lambda_summary$lambda[1]
+writeLines(as.character(best_lambda), "data_generated/best_lambda.txt")
+cat("Selected lambda:", best_lambda, "\n")
+
+# Filter dataset to best lambda
+mycriteria_eff_best <- mycriteria_eff_by_lambda %>%
+  dplyr::filter(lambda == best_lambda)
+
+readr::write_csv(mycriteria_eff_best,
+                 "data_generated/mycriteria_eff_best_lambda.csv")
+
+# df_all used by subsequent objectives
+df_all <- mycriteria_eff_best
+```
+
+## Part E — Mean Efficiency Tables and Plots (k = 3 to 10)
+
+```{r obj1-reg-plots}
+K_MAX <- 10L
+
+tab_mean_reg <- df_all %>%
+  dplyr::filter(k <= K_MAX) %>%
+  dplyr::group_by(k, family) %>%
+  dplyr::summarise(
+    meanD_cube   = mean(Deff_cube,   na.rm = TRUE),
+    meanA_cube   = mean(Aeff_cube,   na.rm = TRUE),
+    meanG_cube   = mean(Geff_cube,   na.rm = TRUE),
+    meanD_sphere = mean(Deff_sphere, na.rm = TRUE),
+    meanA_sphere = mean(Aeff_sphere, na.rm = TRUE),
+    meanG_sphere = mean(Geff_sphere, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  tab_mean_reg,
+  paste0("results_tables/obj1_mean_eff_lambda",
+         best_lambda, "_k3to", K_MAX, ".csv")
+)
+
+lam_label <- paste0("\u03BB = ", best_lambda)   # λ = 0.01
+
+# G-efficiency
+plot_eff_line(tab_mean_reg, "meanG_cube",
+  paste0("Mean regularised G-efficiency (cube), ",  lam_label),
+  paste0("results_figures/reg_meanG_cube_k3to",   K_MAX, ".png"))
+
+plot_eff_line(tab_mean_reg, "meanG_sphere",
+  paste0("Mean regularised G-efficiency (sphere), ", lam_label),
+  paste0("results_figures/reg_meanG_sphere_k3to", K_MAX, ".png"))
+
+# D-efficiency
+plot_eff_line(tab_mean_reg, "meanD_cube",
+  paste0("Mean regularised D-efficiency (cube), ",  lam_label),
+  paste0("results_figures/reg_meanD_cube_k3to",   K_MAX, ".png"))
+
+plot_eff_line(tab_mean_reg, "meanD_sphere",
+  paste0("Mean regularised D-efficiency (sphere), ", lam_label),
+  paste0("results_figures/reg_meanD_sphere_k3to", K_MAX, ".png"))
+
+# A-efficiency
+plot_eff_line(tab_mean_reg, "meanA_cube",
+  paste0("Mean regularised A-efficiency (cube), ",  lam_label),
+  paste0("results_figures/reg_meanA_cube_k3to",   K_MAX, ".png"))
+
+plot_eff_line(tab_mean_reg, "meanA_sphere",
+  paste0("Mean regularised A-efficiency (sphere), ", lam_label),
+  paste0("results_figures/reg_meanA_sphere_k3to", K_MAX, ".png"))
+
+# Combined G: cube vs sphere, faceted by family
+tab_G_long_reg <- tab_mean_reg %>%
+  tidyr::pivot_longer(cols = c(meanG_cube, meanG_sphere),
+                      names_to  = "region",
+                      values_to = "meanG") %>%
+  dplyr::mutate(region = dplyr::recode(region,
+                                       meanG_cube   = "Cube",
+                                       meanG_sphere = "Sphere"))
+
+pG_combined_reg <- ggplot(tab_G_long_reg,
+  aes(x = k, y = meanG,
+      group = region, colour = region,
+      linetype = region, shape = region)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.8) +
+  facet_wrap(~family) +
+  labs(x = "Number of factors (k)",
+       y = paste0("Mean regularised G-efficiency (", lam_label, ")"),
+       colour = "Region", linetype = "Region", shape = "Region") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+ggsave(
+  paste0("results_figures/reg_Geff_cube_vs_sphere_facets_k3to",
+         K_MAX, ".png"),
+  pG_combined_reg, width = 10, height = 6
+)
+```
+
+\newpage
+
+# Objective 2: Spectral Characterisation of Information Matrices
+
+## Part 1 — Extract Spectral Features
+
+For each design configuration, eigenvalues of $M_\lambda$ are computed and
+the following spectral quantities are recorded: minimum eigenvalue
+$\lambda_{\min}$, condition number $\kappa(M_\lambda)$, log-determinant
+$\log|M_\lambda|$, and eigenvalue quantiles $q_{10}$, $q_{50}$, $q_{90}$.
+
+```{r obj2-spectral-features}
+lambda_sp <- 1e-2   # optimal lambda from Objective 1
+
+spec_list <- vector("list", nrow(meta_reg))
+
+for (i in seq_len(nrow(meta_reg))) {
+  id    <- meta_reg$DesignID[i]
+  fpath <- file.path("data_generated", paste0("design_", id, ".rds"))
+  if (!file.exists(fpath)) next
+
+  pts  <- readRDS(fpath)
+  X    <- build_X_quadratic(pts)
+  p    <- ncol(X)
+  Mlam <- crossprod(X) + lambda_sp * diag(p)
+
+  ev <- sort(
+    eigen(Mlam, symmetric = TRUE, only.values = TRUE)$values
+  )
+  ev <- ev[is.finite(ev) & ev > 0]
+  if (length(ev) < 5) next
+
+  q <- quantile(ev, probs = c(0.10, 0.50, 0.90), names = FALSE)
+
+  spec_list[[i]] <- tibble::tibble(
+    DesignID       = id,
+    eig_q10_lam    = q[1],
+    eig_q50_lam    = q[2],
+    eig_q90_lam    = q[3],
+    eig_spread_lam = q[3] / q[1],          # q90 / q10 spread
+    min_eig_lam    = min(ev),
+    condM_lam      = max(ev) / min(ev),    # condition number
+    logdet_lam     = sum(log(ev))          # log-determinant
+  )
+}
+
+spec_dist <- dplyr::bind_rows(spec_list)
+
+# Join spectral features with efficiency data
+df_spec <- df_all %>%
+  dplyr::left_join(spec_dist, by = "DesignID") %>%
+  dplyr::filter(!is.na(condM_lam)) %>%
+  dplyr::mutate(log_cond = log(condM_lam))
+
+readr::write_csv(df_spec,
+                 "results_tables1/objective2_design_level_spectrum.csv")
+```
+
+## Part 2 — Spectral Summary by k and Family
+
+```{r obj2-spectral-summary}
+spec_summary <- df_spec %>%
+  dplyr::group_by(k, family) %>%
+  dplyr::summarise(
+    mean_condM   = mean(condM_lam),
+    mean_logdet  = mean(logdet_lam),
+    mean_min_eig = mean(min_eig_lam),
+    mean_q10     = mean(eig_q10_lam),
+    mean_q50     = mean(eig_q50_lam),
+    mean_q90     = mean(eig_q90_lam),
+    mean_spread  = mean(eig_spread_lam),
+    .groups      = "drop"
+  )
+
+readr::write_csv(spec_summary,
+  "results_tables1/objective2_spectral_summary_by_k_family.csv")
+```
+
+## Part 3 — Spectral Growth Models
+
+Linear models are fitted to characterise how the condition number and
+log-determinant scale with dimension $k$.
+
+```{r obj2-growth-models}
+growth_fits <- spec_summary %>%
+  dplyr::group_by(family) %>%
+  dplyr::do({
+    fit_cond <- lm(log(mean_condM) ~ k, data = .)
+    fit_det  <- lm(mean_logdet    ~ k, data = .)
+    tibble::tibble(
+      cond_slope   = coef(fit_cond)[2],
+      cond_r2      = summary(fit_cond)$r.squared,
+      logdet_slope = coef(fit_det)[2],
+      logdet_r2    = summary(fit_det)$r.squared
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(growth_fits,
+  "results_tables1/objective2_growth_rate_models.csv")
+```
+
+## Part 4 — Spectral Plots
+
+```{r obj2-plots}
+# Eigenvalue quantile profiles
+spec_q_long <- spec_summary %>%
+  tidyr::pivot_longer(cols = c(mean_q10, mean_q50, mean_q90),
+                      names_to  = "quantile",
+                      values_to = "value") %>%
+  dplyr::mutate(quantile = dplyr::recode(quantile,
+    mean_q10 = "q[10]", mean_q50 = "q[50]", mean_q90 = "q[90]"))
+
+p_quantiles <- ggplot(spec_q_long,
+  aes(x = k, y = value, colour = family, group = family)) +
+  geom_line() + geom_point() +
+  facet_wrap(~quantile, scales = "free_y", labeller = label_parsed) +
+  labs(x = "Number of factors (k)",
+       y = "Mean eigenvalue quantile",
+       colour = "CCD family") +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/objective2_eigenvalue_quantiles.png",
+       p_quantiles, width = 10, height = 6)
+
+# Condition number growth
+p_cond <- ggplot(spec_summary,
+  aes(x = k, y = mean_condM, colour = family, group = family)) +
+  geom_line() + geom_point() +
+  labs(x = "Number of factors (k)",
+       y = expression(kappa(M[lambda])),
+       colour = "CCD family") +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/objective2_condition_number_growth.png",
+       p_cond, width = 8, height = 5)
+
+# Log-determinant growth
+p_det <- ggplot(spec_summary,
+  aes(x = k, y = mean_logdet, colour = family, group = family)) +
+  geom_line() + geom_point() +
+  labs(x = "Number of factors (k)",
+       y = expression(log~"|"~M[lambda]~"|"),
+       colour = "CCD family") +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/objective2_logdet_growth.png",
+       p_det, width = 8, height = 5)
+```
+
+## Part 5 — Linear Regression: Spectrum vs Efficiency
+
+```{r obj2-regression}
+# Six OLS models: one per (criterion x region) combination
+fit_G_cube   <- lm(Geff_cube   ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+fit_A_cube   <- lm(Aeff_cube   ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+fit_D_cube   <- lm(Deff_cube   ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+fit_G_sphere <- lm(Geff_sphere ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+fit_A_sphere <- lm(Aeff_sphere ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+fit_D_sphere <- lm(Deff_sphere ~ log_cond + logdet_lam + k + family,
+                   data = df_spec)
+
+# Compile tidy coefficient tables
+coef_out <- dplyr::bind_rows(
+  broom::tidy(fit_G_cube)   %>% dplyr::mutate(model = "G", region = "cube"),
+  broom::tidy(fit_A_cube)   %>% dplyr::mutate(model = "A", region = "cube"),
+  broom::tidy(fit_D_cube)   %>% dplyr::mutate(model = "D", region = "cube"),
+  broom::tidy(fit_G_sphere) %>% dplyr::mutate(model = "G", region = "sphere"),
+  broom::tidy(fit_A_sphere) %>% dplyr::mutate(model = "A", region = "sphere"),
+  broom::tidy(fit_D_sphere) %>% dplyr::mutate(model = "D", region = "sphere")
+)
+
+readr::write_csv(coef_out,
+  "results_tables1/objective2_spectrum_efficiency_regression.csv")
+
+# Scatter plots: efficiency vs log(condition number), by family
+plot_spec_link <- function(yvar, region_label, outfile) {
+  ggplot(df_spec,
+    aes(x = log_cond, y = .data[[yvar]], colour = family)) +
+    geom_point(alpha = 0.45, size = 1.2) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1.1) +
+    labs(
+      x      = expression(log~kappa(M[lambda])),
+      y      = paste0(yvar, " (", region_label, ")"),
+      colour = "CCD family"
+    ) +
+    theme_minimal(base_size = 14)
+  ggsave(outfile, width = 9, height = 6)
+}
+
+for (spec_resp in c("Geff_cube","Aeff_cube","Deff_cube",
+                    "Geff_sphere","Aeff_sphere","Deff_sphere")) {
+  rgn <- ifelse(grepl("cube", spec_resp), "cube", "sphere")
+  plot_spec_link(
+    spec_resp, rgn,
+    paste0("results_figures1/obj2_link_", spec_resp, "_vs_logcond.png")
+  )
+}
+```
+
+\newpage
+
+# Objective 3: Cross-Dimensional Stability (CDS)
+
+```{r obj3-cds}
+# Efficiency columns from the regularised best-lambda dataset
+eff_cols <- c("Deff_cube","Aeff_cube","Geff_cube",
+              "Deff_sphere","Aeff_sphere","Geff_sphere")
+
+df_obj3 <- df_all %>%
+  dplyr::mutate(k = as.integer(k), family = as.factor(family))
+
+# ── 1) Reshape to long format ─────────────────────────────────────────────────
+eff_long <- df_obj3 %>%
+  dplyr::select(k, family, dplyr::all_of(eff_cols)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(eff_cols),
+                      names_to  = "metric_region",
+                      values_to = "eff") %>%
+  dplyr::mutate(
+    metric = dplyr::case_when(
+      grepl("^Deff_", metric_region) ~ "D",
+      grepl("^Aeff_", metric_region) ~ "A",
+      grepl("^Geff_", metric_region) ~ "G"
+    ),
+    region = dplyr::case_when(
+      grepl("_cube$",   metric_region) ~ "cube",
+      grepl("_sphere$", metric_region) ~ "sphere"
+    ),
+    metric = factor(metric, levels = c("D","A","G")),
+    region = factor(region, levels = c("cube","sphere"))
+  ) %>%
+  dplyr::filter(!is.na(metric), !is.na(region))
+
+# ── 2) Mean efficiencies by (k, family, metric, region) ──────────────────────
+tab_mean_cds <- eff_long %>%
+  dplyr::group_by(k, family, metric, region) %>%
+  dplyr::summarise(
+    meanEff = mean(eff, na.rm = TRUE),
+    sdEff   = sd(eff,   na.rm = TRUE),
+    n       = sum(!is.na(eff)),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_mean_cds,
+                 "results_tables/objective3_mean_eff_by_k_family.csv")
+
+# ── 3) CDS stability indices ──────────────────────────────────────────────────
+cds_summary <- tab_mean_cds %>%
+  dplyr::group_by(family, metric, region) %>%
+  dplyr::summarise(
+    CDS_var   = var(meanEff,  na.rm = TRUE),
+    CDS_sd    = sd(meanEff,   na.rm = TRUE),
+    CDS_range = max(meanEff)  - min(meanEff),
+    # Positive = improvement, negative = degradation from k=3 to k=10
+    CDS_change = meanEff[k == max(k)][1] - meanEff[k == min(k)][1],
+    mean_over_k = mean(meanEff),
+    .groups   = "drop"
+  )
+
+readr::write_csv(cds_summary,
+                 "results_tables/objective3_CDS_summary.csv")
+
+# ── 4) Scaling exponents: log(meanEff) = beta0 + beta1 * log(k) ──────────────
+scaling_fits <- tab_mean_cds %>%
+  dplyr::filter(meanEff > 0) %>%
+  dplyr::mutate(logMeanEff = log(meanEff), logk = log(k)) %>%
+  dplyr::group_by(family, metric, region) %>%
+  dplyr::do({
+    fit <- lm(logMeanEff ~ logk, data = .)
+    sm  <- summary(fit)
+    data.frame(
+      beta0   = coef(fit)[1],
+      beta1   = coef(fit)[2],
+      r2      = sm$r.squared,
+      adj_r2  = sm$adj.r.squared,
+      p_beta1 = sm$coefficients["logk", "Pr(>|t|)"]
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(scaling_fits,
+                 "results_tables/objective3_scaling_exponents.csv")
+
+# ── 5A) Mean efficiency curves ────────────────────────────────────────────────
+p_curves <- ggplot(tab_mean_cds,
+  aes(x = k, y = meanEff,
+      colour   = family,
+      linetype = family,
+      shape    = family,
+      group    = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.6) +
+  facet_grid(metric ~ region, scales = "free_y") +
+  labs(x = "Number of factors (k)", y = "Mean efficiency",
+       colour = "CCD family", linetype = "CCD family",
+       shape  = "CCD family") +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures/objective3_mean_eff_curves.png",
+       p_curves, width = 11, height = 7)
+
+# ── 5B) Scaling exponent bar chart ────────────────────────────────────────────
+p_beta <- ggplot(scaling_fits,
+  aes(x = family, y = beta1, fill = family)) +
+  geom_col() +
+  facet_grid(metric ~ region, scales = "free_y") +
+  labs(x = "CCD family",
+       y = expression(hat(beta)[1])) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+ggsave("results_figures/objective3_scaling_beta1.png",
+       p_beta, width = 10, height = 6)
+
+# ── 5C) CDS variance heatmap ─────────────────────────────────────────────────
+p_heat <- cds_summary %>%
+  dplyr::mutate(criterion_region = paste(metric, region, sep = " | ")) %>%
+  ggplot(aes(x = criterion_region, y = family, fill = CDS_var)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  scale_fill_gradient(low = "#EBF5FB", high = "#1A5276",
+                      name = expression(CDS[var])) +
+  labs(x = "Criterion | Region", y = "CCD family",
+       title = "Cross-Dimensional Stability Variance Heatmap") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("results_figures/objective3_CDS_heatmap.png",
+       p_heat, width = 9, height = 5)
+```
+
+\newpage
+
+# Objective 4: Machine Learning Validation
+
+A reusable function `run_ml_models()` fits all eight algorithms for a given
+response variable and returns a performance table and the fitted XGBoost
+model object (for subsequent importance extraction).
+
+```{r obj4-ml-function}
+run_ml_models <- function(df_all,
+                          response,
+                          xvars_candidate,
+                          out_dir_figs = "results_figures4",
+                          out_dir_tabs = "results_tables4",
+                          n_trees_rf   = 800L,
+                          xgb_rounds   = 600L,
+                          knn_k        = 15L) {
+
+  # ── Filter to available predictors ──────────────────────────────────────────
+  Xvars <- xvars_candidate[xvars_candidate %in% names(df_all)]
+
+  model_df <- df_all %>%
+    dplyr::filter(
+      complete.cases(dplyr::across(dplyr::all_of(c(Xvars, response))))
+    )
+
+  cat("Response:", response, "| Rows:", nrow(model_df),
+      "| Predictors:", length(Xvars), "\n")
+
+  # ── 80 / 20 train-test split ─────────────────────────────────────────────────
+  idx     <- sample(seq_len(nrow(model_df)), floor(0.8 * nrow(model_df)))
+  train   <- model_df[ idx, ]
+  test    <- model_df[-idx, ]
+
+  x_train <- as.matrix(train[, Xvars])
+  x_test  <- as.matrix(test[,  Xvars])
+  y_train <- train[[response]]
+  y_test  <- test[[response]]
+
+  # Standardised versions for SVR and KNN
+  x_train_sc <- scale(x_train)
+  x_test_sc  <- scale(x_test,
+    center = attr(x_train_sc, "scaled:center"),
+    scale  = attr(x_train_sc, "scaled:scale"))
+
+  metrics_out <- list()
+  xgb_model   <- NULL
+
+  # ── Model 1: Ordinary Least Squares ─────────────────────────────────────────
+  fit_lm <- lm(
+    as.formula(paste(response, "~ .")),
+    data = train[, c(response, Xvars)]
+  )
+  pred <- predict(fit_lm, newdata = test)
+  metrics_out[["LM"]] <- data.frame(
+    model = "Linear Regression",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("LM_",        response), out_dir_figs)
+
+  # ── Model 2: Ridge Regression ────────────────────────────────────────────────
+  cv_ridge <- glmnet::cv.glmnet(x_train, y_train, alpha = 0)
+  pred     <- as.numeric(predict(cv_ridge, x_test, s = "lambda.min"))
+  metrics_out[["Ridge"]] <- data.frame(
+    model = "Ridge",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("Ridge_",     response), out_dir_figs)
+
+  # ── Model 3: Lasso ───────────────────────────────────────────────────────────
+  cv_lasso <- glmnet::cv.glmnet(x_train, y_train, alpha = 1)
+  pred     <- as.numeric(predict(cv_lasso, x_test, s = "lambda.min"))
+  metrics_out[["Lasso"]] <- data.frame(
+    model = "Lasso",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("Lasso_",     response), out_dir_figs)
+
+  # ── Model 4: Elastic Net (alpha = 0.5) ───────────────────────────────────────
+  cv_enet <- glmnet::cv.glmnet(x_train, y_train, alpha = 0.5)
+  pred    <- as.numeric(predict(cv_enet, x_test, s = "lambda.min"))
+  metrics_out[["ElasticNet"]] <- data.frame(
+    model = "Elastic Net",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("ElasticNet_", response), out_dir_figs)
+
+  # ── Model 5: Random Forest ───────────────────────────────────────────────────
+  rf   <- ranger::ranger(
+    formula    = as.formula(paste(response, "~ .")),
+    data       = train[, c(response, Xvars)],
+    num.trees  = n_trees_rf,
+    importance = "permutation"
+  )
+  pred <- predict(rf, data = test[, Xvars])$predictions
+  metrics_out[["RF"]] <- data.frame(
+    model = "Random Forest",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("RF_",        response), out_dir_figs)
+
+  p_imp <- vip::vip(rf, num_features = 12) +
+    ggplot2::ggtitle(paste("RF Variable Importance:", response))
+  ggplot2::ggsave(
+    file.path(out_dir_figs, paste0("importance_RF_", response, ".png")),
+    p_imp, width = 8, height = 5
+  )
+
+  # ── Model 6: XGBoost ─────────────────────────────────────────────────────────
+  dtrain    <- xgboost::xgb.DMatrix(data = x_train, label = y_train)
+  dtest     <- xgboost::xgb.DMatrix(data = x_test,  label = y_test)
+
+  xgb_params <- list(
+    objective        = "reg:squarederror",
+    eval_metric      = "rmse",
+    max_depth        = 5L,
+    eta              = 0.06,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  )
+
+  xgb_model <- xgboost::xgb.train(
+    params  = xgb_params,
+    data    = dtrain,
+    nrounds = xgb_rounds,
+    verbose = 0
+  )
+
+  pred <- predict(xgb_model, dtest)
+  metrics_out[["XGB"]] <- data.frame(
+    model = "XGBoost",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("XGBoost_",   response), out_dir_figs)
+
+  # ── Model 7: Support Vector Regression (RBF kernel) ──────────────────────────
+  svr  <- e1071::svm(x = x_train_sc, y = y_train,
+                     type   = "eps-regression",
+                     kernel = "radial")
+  pred <- predict(svr, x_test_sc)
+  metrics_out[["SVR"]] <- data.frame(
+    model = "SVR",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("SVR_",       response), out_dir_figs)
+
+  # ── Model 8: K-Nearest Neighbours (K = 15) ───────────────────────────────────
+  knn  <- FNN::knn.reg(train = x_train_sc, test = x_test_sc,
+                       y = y_train, k = knn_k)
+  pred <- knn$pred
+  metrics_out[["KNN"]] <- data.frame(
+    model = "KNN",
+    rmse  = reg_metrics(y_test, pred)["rmse"],
+    r2    = reg_metrics(y_test, pred)["r2"]
+  )
+  save_obs_pred_plot(y_test, pred,
+    paste0("KNN_",       response), out_dir_figs)
+
+  # ── Compile and save performance table ───────────────────────────────────────
+  metrics_tbl <- dplyr::bind_rows(metrics_out) %>%
+    dplyr::mutate(
+      response = response,
+      n_train  = nrow(train),
+      n_test   = nrow(test)
+    ) %>%
+    dplyr::arrange(rmse)
+
+  readr::write_csv(
+    metrics_tbl,
+    file.path(out_dir_tabs, paste0("ML_metrics_", response, ".csv"))
+  )
+
+  list(metrics = metrics_tbl, xgb_model = xgb_model)
+}
+```
+
+## Run Models for All Four Response Variables
+
+```{r obj4-run-models}
+# Candidate predictor set (only those present in df_all are retained)
+Xvars_candidate <- c(
+  "k", "nc", "rf", "ra", "alpha", "N", "Nf", "Na", "Nc",
+  "log_condM_lam", "min_eig_lam", "logdet_lam",
+  "eig_spread_lam", "eig_q10_lam", "eig_q90_lam"
+)
+
+# Note: df_all must contain the spectral columns from Objective 2.
+# Join spec_dist if not already present.
+if (!"log_condM_lam" %in% names(df_all)) {
+  df_all <- df_all %>%
+    dplyr::left_join(
+      spec_dist %>%
+        dplyr::rename(log_condM_lam = condM_lam) %>%
+        dplyr::mutate(log_condM_lam = log(log_condM_lam)),
+      by = "DesignID"
+    )
+}
+
+# G-efficiency — cube
+res_Gcube   <- run_ml_models(df_all, "Geff_cube",   Xvars_candidate)
+
+# G-efficiency — sphere
+res_Gsphere <- run_ml_models(df_all, "Geff_sphere", Xvars_candidate)
+
+# A-efficiency — sphere
+res_Asphere <- run_ml_models(df_all, "Aeff_sphere", Xvars_candidate)
+
+# D-efficiency — sphere
+res_Dsphere <- run_ml_models(df_all, "Deff_sphere", Xvars_candidate)
+```
+
+## Combined XGBoost Variable Importance
+
+```{r obj4-xgb-importance}
+imp_all <- dplyr::bind_rows(
+  get_xgb_importance(res_Gcube$xgb_model,   "Geff (cube)"),
+  get_xgb_importance(res_Gsphere$xgb_model, "Geff (sphere)"),
+  get_xgb_importance(res_Asphere$xgb_model, "Aeff (sphere)"),
+  get_xgb_importance(res_Dsphere$xgb_model, "Deff (sphere)")
+)
+
+readr::write_csv(imp_all,
+                 "results_tables/xgb_importance_combined.csv")
+
+# Top-12 features per model, plotted with free y-axis per facet
+top_features <- imp_all %>%
+  dplyr::group_by(response) %>%
+  dplyr::slice_max(order_by = Gain_norm, n = 12, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(Feature) %>%
+  dplyr::pull(Feature)
+
+imp_plot <- imp_all %>%
+  dplyr::filter(Feature %in% top_features) %>%
+  dplyr::group_by(response) %>%
+  dplyr::mutate(
+    Feature = reorder_within(Feature, Gain_norm, response)
+  ) %>%
+  dplyr::ungroup()
+
+p_imp_combined <- ggplot(imp_plot,
+  aes(x = Feature, y = Gain_norm)) +
+  geom_col(fill = "#2E86C1") +
+  coord_flip() +
+  facet_wrap(~response, scales = "free_y") +
+  scale_x_reordered() +
+  labs(
+    x = "Predictor",
+    y = "Normalised XGBoost importance (Gain)"
+  ) +
+  theme_minimal(base_size = 13)
+
+ggsave("results_figures/xgb_importance_combined_facets.png",
+       p_imp_combined, width = 12, height = 7)
+```
+
+\newpage
+
+# Objective 5: Multi-Class Classification of CCD Family
+
+```{r obj5-classification}
+# ── Predictor set for classification ─────────────────────────────────────────
+Xvars_cls <- c(
+  "k", "nc", "rf", "ra", "alpha", "N", "Nf", "Na", "Nc",
+  "log_condM_lam", "min_eig_lam", "logdet_lam",
+  "eig_q10_lam", "eig_q50_lam", "eig_q90_lam", "eig_spread_lam"
+)
+Xvars_cls <- Xvars_cls[Xvars_cls %in% names(df_all)]
+
+model_df_cls <- df_all %>%
+  dplyr::select(family, dplyr::all_of(Xvars_cls)) %>%
+  dplyr::filter(complete.cases(.)) %>%
+  dplyr::mutate(family = factor(family))
+
+# ── Stratified 80/20 train-test split ────────────────────────────────────────
+split_cls <- rsample::initial_split(model_df_cls,
+                                    prop    = 0.8,
+                                    strata  = family)
+train_cls <- rsample::training(split_cls)
+test_cls  <- rsample::testing(split_cls)
+
+# ── Stratified 5-fold CV folds ───────────────────────────────────────────────
+folds_cls <- rsample::vfold_cv(train_cls, v = 5, strata = family)
+
+# ── Pre-processing recipe ─────────────────────────────────────────────────────
+rec_cls <- recipes::recipe(family ~ ., data = train_cls) %>%
+  recipes::step_zv(recipes::all_predictors()) %>%
+  recipes::step_normalize(recipes::all_numeric_predictors())
+
+cls_metrics <- yardstick::metric_set(yardstick::accuracy)
+
+# ── Model specifications ──────────────────────────────────────────────────────
+rf_cls_spec <- parsnip::rand_forest(
+  mode  = "classification",
+  trees = 800L,
+  mtry  = tune::tune(),
+  min_n = tune::tune()
+) %>% parsnip::set_engine("ranger", importance = "permutation")
+
+mlog_spec <- parsnip::multinom_reg(mode = "classification") %>%
+  parsnip::set_engine("nnet")
+
+xgb_cls_spec <- parsnip::boost_tree(
+  mode         = "classification",
+  trees        = tune::tune(),
+  tree_depth   = tune::tune(),
+  learn_rate   = tune::tune(),
+  mtry         = tune::tune(),
+  min_n        = tune::tune(),
+  loss_reduction = tune::tune(),
+  sample_size  = tune::tune()
+) %>% parsnip::set_engine("xgboost")
+
+svm_cls_spec <- parsnip::svm_rbf(
+  mode      = "classification",
+  cost      = tune::tune(),
+  rbf_sigma = tune::tune()
+) %>% parsnip::set_engine("kernlab")
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+wf_rf_cls   <- workflows::workflow() %>%
+  workflows::add_recipe(rec_cls) %>%
+  workflows::add_model(rf_cls_spec)
+
+wf_mlog_cls <- workflows::workflow() %>%
+  workflows::add_recipe(rec_cls) %>%
+  workflows::add_model(mlog_spec)
+
+wf_xgb_cls  <- workflows::workflow() %>%
+  workflows::add_recipe(rec_cls) %>%
+  workflows::add_model(xgb_cls_spec)
+
+wf_svm_cls  <- workflows::workflow() %>%
+  workflows::add_recipe(rec_cls) %>%
+  workflows::add_model(svm_cls_spec)
+
+# ── Tuning grids ──────────────────────────────────────────────────────────────
+rf_cls_grid <- dials::grid_regular(
+  dials::mtry(range = c(2L, max(2L, length(Xvars_cls)))),
+  dials::min_n(range = c(2L, 20L)),
+  levels = 5L
+)
+
+xgb_cls_grid <- dials::grid_latin_hypercube(
+  dials::trees(range        = c(200L,  1200L)),
+  dials::tree_depth(range   = c(2L,    8L)),
+  dials::learn_rate(range   = c(0.01,  0.3)),
+  dials::mtry(range         = c(2L,    max(2L, length(Xvars_cls)))),
+  dials::min_n(range        = c(2L,    30L)),
+  dials::loss_reduction(),
+  sample_size = dials::sample_prop(),
+  size = 25L
+)
+
+svm_cls_grid <- dials::grid_regular(
+  dials::cost(range      = c(-3, 3)),
+  dials::rbf_sigma(range = c(-5, 0)),
+  levels = 7L
+)
+
+# ── Cross-validated fitting ───────────────────────────────────────────────────
+rf_cls_res   <- tune::tune_grid(wf_rf_cls,  folds_cls,
+                                grid = rf_cls_grid,  metrics = cls_metrics)
+mlog_cls_res <- tune::fit_resamples(wf_mlog_cls, folds_cls,
+                                    metrics = cls_metrics)
+xgb_cls_res  <- tune::tune_grid(wf_xgb_cls, folds_cls,
+                                grid = xgb_cls_grid, metrics = cls_metrics)
+svm_cls_res  <- tune::tune_grid(wf_svm_cls, folds_cls,
+                                grid = svm_cls_grid, metrics = cls_metrics)
+
+# ── Finalise workflows on full training set ───────────────────────────────────
+final_rf_cls   <- tune::finalize_workflow(
+  wf_rf_cls,  tune::select_best(rf_cls_res,  "accuracy")) %>%
+  parsnip::fit(train_cls)
+
+final_mlog_cls <- parsnip::fit(wf_mlog_cls, data = train_cls)
+
+final_xgb_cls  <- tune::finalize_workflow(
+  wf_xgb_cls, tune::select_best(xgb_cls_res, "accuracy")) %>%
+  parsnip::fit(train_cls)
+
+final_svm_cls  <- tune::finalize_workflow(
+  wf_svm_cls, tune::select_best(svm_cls_res, "accuracy")) %>%
+  parsnip::fit(train_cls)
+
+# ── CV accuracy summary ───────────────────────────────────────────────────────
+cv_acc_summary <- dplyr::bind_rows(
+  tune::collect_metrics(rf_cls_res)   %>%
+    dplyr::filter(.metric == "accuracy") %>%
+    dplyr::mutate(model = "Random Forest"),
+  tune::collect_metrics(mlog_cls_res) %>%
+    dplyr::filter(.metric == "accuracy") %>%
+    dplyr::mutate(model = "Multinomial Logistic"),
+  tune::collect_metrics(xgb_cls_res)  %>%
+    dplyr::filter(.metric == "accuracy") %>%
+    dplyr::mutate(model = "XGBoost"),
+  tune::collect_metrics(svm_cls_res)  %>%
+    dplyr::filter(.metric == "accuracy") %>%
+    dplyr::mutate(model = "SVM-RBF")
+) %>%
+  dplyr::select(model, mean, std_err, n) %>%
+  dplyr::arrange(dplyr::desc(mean))
+
+readr::write_csv(cv_acc_summary,
+  "results_tables4/objective5_CV_accuracy_summary.csv")
+
+# ── Test-set confusion matrices and accuracy ──────────────────────────────────
+eval_classifier <- function(fitted_wf, test_df, model_name) {
+  preds <- predict(fitted_wf, test_df, type = "class") %>%
+    dplyr::bind_cols(test_df %>% dplyr::select(family))
+
+  list(
+    model    = model_name,
+    accuracy = yardstick::accuracy(preds,
+                 truth    = family,
+                 estimate = .pred_class),
+    conf_mat = yardstick::conf_mat(preds,
+                 truth    = family,
+                 estimate = .pred_class)
+  )
+}
+
+res_rf_cls   <- eval_classifier(final_rf_cls,   test_cls, "Random Forest")
+res_mlog_cls <- eval_classifier(final_mlog_cls, test_cls, "Multinomial Logistic")
+res_xgb_cls  <- eval_classifier(final_xgb_cls,  test_cls, "XGBoost")
+res_svm_cls  <- eval_classifier(final_svm_cls,  test_cls, "SVM-RBF")
+
+# Print results
+cat("\n=== Test-set Classification Results ===\n")
+for (res in list(res_rf_cls, res_mlog_cls, res_xgb_cls, res_svm_cls)) {
+  cat(res$model, "| Accuracy:",
+      round(res$accuracy$.estimate, 4), "\n")
+  print(res$conf_mat)
+  cat("\n")
+}
+```
+
+\newpage
+
+# Session Information
+
+Recorded for full reproducibility.
+
+```{r session-info, eval=TRUE, echo=TRUE}
+sessionInfo()
+```

@@ -1,0 +1,2561 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "2026-03-12"
+---
+
+```{r}
+
+# ============================================================
+# APPENDIX: COMPLETE R CODE
+# PhD ANALYSIS: Cross-Dimensional Stability and Spectral
+# Characteristics of Central Composite Designs Under
+# Alphabetic Optimality Criteria
+#
+# OBJECTIVES:
+#   1. Construct and evaluate CCDs (FCCD, RCCD, SCCD) for k = 3 to 10
+#      and calculate D-, A-, and G-optimality criteria
+#   2. Investigate the spectral characteristics of the information matrix
+#   3. Define and measure Cross-Dimensional Stability (CDS)
+#   4. Machine Learning validation across five models:
+#        - Linear Regression (baseline)
+#        - Random Forest
+#        - XGBoost
+#        - Support Vector Regression (SVR)
+#        - K-Nearest Neighbours Regression (KNN)
+#        - Decision Tree
+#      [Includes ML effectiveness analysis across dimensional bands]
+#
+# NOTE: This version uses PROPER SCALED REGULARISATION where:
+#   lambda_effective = lambda_base * tr(X'X) / p
+#                    = lambda_base * mean(diag(X'X))
+# This ensures consistent regularisation strength across dimensions
+# by making lambda a fraction of the average information, rather than
+# an absolute value that becomes negligible as p grows.
+# ============================================================
+
+
+# ============================================================
+# SECTION 0: PACKAGES AND DIRECTORY SETUP
+# ============================================================
+
+pkgs <- c(
+  "dplyr", "tidyr", "ggplot2", "readr", "tibble", "stringr",
+  "FrF2",
+  "ranger",   # Random Forest
+  "xgboost",  # XGBoost
+  "e1071",    # Support Vector Regression (SVR)
+  "FNN",      # K-Nearest Neighbours Regression
+  "rpart",    # Decision Tree (CART)
+  "rpart.plot", # Decision Tree visualisation
+  "vip", "broom",
+  "rsample", "recipes", "parsnip", "workflows",
+  "tune", "yardstick", "dials"
+)
+
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, quiet = TRUE)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}
+
+dirs <- c(
+  "data_generated",
+  "results_tables",  "results_figures",
+  "results_tables1", "results_figures1",
+  "results_tables2", "results_figures2",
+  "results_tables4", "results_figures4"
+)
+for (d in dirs) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(6)
+cat("Setup complete.\n")
+
+
+# ============================================================
+# SECTION 0B: SHARED HELPER FUNCTIONS
+# ============================================================
+
+# ----------------------------------------------------------
+# make_ccd()
+# Generates a Central Composite Design (factorial + axial + centre)
+# with replication controls supporting FCCD, RCCD, and SCCD families.
+#   k = 3 to 5  -> full 2^k factorial core
+#   k = 6 to 10 -> fixed 32-run (2^5) factorial core
+# ----------------------------------------------------------
+make_ccd <- function(k, family, nc, rf, ra) {
+
+  alpha <- switch(family,
+    "FCCD" = 1,
+    "RCCD" = (2^k)^(1/4),
+    "SCCD" = sqrt(k),
+    stop("Unknown family: ", family)
+  )
+
+  if (k <= 5) {
+    fac <- as.data.frame(FrF2::FrF2(nruns = 2^k, nfactors = k))
+  } else {
+    fac <- as.data.frame(FrF2::FrF2(nruns = 32, nfactors = k))
+  }
+
+  fac <- fac[, 1:k, drop = FALSE]
+  colnames(fac) <- paste0("x", 1:k)
+  fac <- dplyr::mutate_all(fac, ~ ifelse(. == 1, 1, -1))
+  fac_rep <- fac[rep(seq_len(nrow(fac)), rf), , drop = FALSE]
+
+  ax <- matrix(0, nrow = 2 * k, ncol = k)
+  for (j in 1:k) { ax[2*j-1, j] <- alpha; ax[2*j, j] <- -alpha }
+  ax <- as.data.frame(ax)
+  colnames(ax) <- paste0("x", 1:k)
+  ax_rep <- ax[rep(seq_len(nrow(ax)), ra), , drop = FALSE]
+
+  cen <- as.data.frame(matrix(0, nrow = nc, ncol = k))
+  colnames(cen) <- paste0("x", 1:k)
+
+  pts <- dplyr::bind_rows(fac_rep, ax_rep, cen)
+  id  <- paste0(family, "_k", k, "_nc", nc, "_rf", rf, "_ra", ra)
+
+  meta <- tibble::tibble(
+    DesignID = id, k = k, family = family,
+    nc = nc, rf = rf, ra = ra, alpha = alpha,
+    N  = nrow(pts),
+    Nf = nrow(fac_rep),
+    Na = nrow(ax_rep),
+    Nc = nc
+  )
+
+  list(points = pts, meta = meta)
+}
+
+# ----------------------------------------------------------
+# build_X_quadratic()
+# Builds the full second-order regression model matrix X,
+# including intercept, linear terms, squared terms, and
+# all pairwise interaction terms.
+# ----------------------------------------------------------
+build_X_quadratic <- function(df) {
+  vars <- names(df)
+  form <- as.formula(paste0(
+    "~ ", paste(vars, collapse = " + "),
+    " + ", paste0("I(", vars, "^2)", collapse = " + "),
+    " + (", paste(vars, collapse = " + "), ")^2"
+  ))
+  model.matrix(form, data = df)
+}
+
+# ----------------------------------------------------------
+# logdet_pd()
+# Computes a numerically stable log-determinant of a positive
+# definite matrix using the Cholesky decomposition.
+# ----------------------------------------------------------
+logdet_pd <- function(M) {
+  R <- chol(M)
+  2 * sum(log(diag(R)))
+}
+
+# ----------------------------------------------------------
+# compute_ADG()
+# Computes regularised D-, A-, and G-optimality criteria for
+# a given design using the regularised information matrix:
+#   M_lambda = X'X + lambda_scaled * I
+#
+# PROPER SCALED REGULARISATION:
+#   The key insight is that regularisation should be a consistent
+#   *fraction* of the information matrix magnitude, not an absolute
+#   value. As dimensions increase, X'X grows in both size and
+#   magnitude, so a fixed lambda becomes negligible.
+#
+#   Default scaling (scale_type = "trace"):
+#     lambda_eff = lambda * (tr(X'X) / p)
+#
+#   This means lambda represents the fraction of the "average
+#   eigenvalue" to add as regularisation. For example, lambda = 0.01
+#   adds 1% of the mean diagonal element of X'X to each diagonal.
+#
+#   This is proper because:
+#     1. It's dimensionally consistent (regularisation scales with data)
+#     2. The relative perturbation to eigenvalues is constant across k
+#     3. It matches the Bayesian interpretation: prior precision is
+#        proportional to data precision
+#     4. Condition number effects are comparable across dimensions
+#
+#   Alternative scaling options (set via scale_type):
+#     "trace"  : lambda_eff = lambda * tr(X'X) / p (DEFAULT, proper scaling)
+#     "mean_diag" : lambda_eff = lambda * mean(diag(X'X)) (equivalent to trace)
+#     "max_eig": lambda_eff = lambda * lambda_max(X'X) (scale with max eigenvalue)
+#     "N"      : lambda_eff = lambda * N (scale with sample size)
+#     "p"      : lambda_eff = lambda * p (scale with parameters only)
+#     "none"   : lambda_eff = lambda (no scaling, original behaviour)
+#
+# G-criterion is approximated via Monte Carlo sampling
+# over the experimental region.
+# ----------------------------------------------------------
+compute_ADG <- function(design_points, g_n = 5000, lambda = 1e-2,
+                        scale_type = "trace") {
+
+  X    <- build_X_quadratic(design_points)
+  p    <- ncol(X)
+  N    <- nrow(X)
+  XtX  <- crossprod(X)
+ 
+  # Compute matrix characteristics for scaling
+  tr_XtX   <- sum(diag(XtX))
+  mean_diag <- tr_XtX / p
+ 
+  # Compute scaled regularisation parameter
+  # Default "trace" scaling makes lambda a fraction of average information
+  lambda_eff <- switch(scale_type,
+    "trace"    = lambda * mean_diag,
+    "mean_diag" = lambda * mean_diag,
+    "max_eig"  = lambda * max(eigen(XtX, symmetric = TRUE, only.values = TRUE)$values),
+    "N"        = lambda * N,
+    "p"        = lambda * p,
+    "none"     = lambda,
+    stop("Unknown scale_type: ", scale_type)
+  )
+ 
+  Mlam <- XtX + diag(lambda_eff, p)
+
+  R <- tryCatch(chol(Mlam), error = function(e) NULL)
+  if (is.null(R)) return(NULL)
+
+  Minv  <- chol2inv(R)
+  Dcrit <- exp(logdet_pd(Mlam) / p)
+  Acrit <- sum(diag(Minv))
+
+  k  <- ncol(design_points)
+  Z  <- matrix(rnorm(g_n * k), ncol = k)
+  Z  <- Z / sqrt(rowSums(Z^2))
+  r  <- runif(g_n)^(1/k) * sqrt(k)
+  Z  <- Z * r
+  colnames(Z) <- colnames(design_points)
+  FZ <- build_X_quadratic(as.data.frame(Z))
+  Gcrit <- max(rowSums((FZ %*% Minv) * FZ))
+
+  list(Dcrit = Dcrit, Acrit = Acrit, Gcrit = Gcrit, lambda_eff = lambda_eff)
+}
+
+# ----------------------------------------------------------
+# reg_metrics()
+# Computes RMSE and R-squared between observed and
+# predicted values for regression model evaluation.
+# ----------------------------------------------------------
+reg_metrics <- function(y_true, y_pred) {
+  rmse <- sqrt(mean((y_pred - y_true)^2))
+  r2   <- 1 - sum((y_true - y_pred)^2) / sum((y_true - mean(y_true))^2)
+  c(RMSE = rmse, R2 = r2)
+}
+
+# ----------------------------------------------------------
+# save_obs_pred()
+# Saves an observed versus predicted scatter plot for a
+# given model and response variable to the specified directory.
+# ----------------------------------------------------------
+save_obs_pred <- function(y_true, y_pred, label, outdir) {
+  df <- data.frame(obs = y_true, pred = y_pred)
+  p  <- ggplot(df, aes(obs, pred)) +
+    geom_point(alpha = 0.4, colour = "#2166ac") +
+    geom_abline(colour = "red", linewidth = 1) +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = paste("Observed vs Predicted:", label),
+      x     = "Observed",
+      y     = "Predicted"
+    )
+  ggsave(
+    file.path(outdir, paste0("obs_pred_", gsub(" ", "_", label), ".png")),
+    p, width = 7, height = 5
+  )
+  invisible(p)
+}
+
+cat("Helper functions defined.\n")
+
+
+# ============================================================
+# OBJECTIVE 1: CONSTRUCT AND EVALUATE CCDs (k = 3 to 10)
+#
+# All designs are evaluated using a regularised information
+# matrix M_lambda = X'X + lambda_scaled*I. The regularisation
+# parameter lambda is automatically selected from a grid
+# search that maximises mean G-efficiency across all designs
+# and dimensions.
+#
+# PROPER SCALED REGULARISATION:
+#   lambda_effective = lambda_base * tr(X'X) / p
+# This ensures regularisation is a consistent fraction of the
+# information matrix magnitude across all dimensions.
+# ============================================================
+
+cat("\n=== OBJECTIVE 1: Design construction and efficiency evaluation ===\n")
+cat("Using PROPER SCALED regularisation: lambda_eff = lambda * tr(X'X) / p\n")
+
+# --- 1A: Define parameter grid and generate all designs ---
+
+k_grid   <- 3:10
+families <- c("FCCD", "RCCD", "SCCD")
+nc_grid  <- c(1, 3, 5, 7, 10)
+rf_grid  <- c(1, 2, 3)
+ra_grid  <- c(1, 2, 3)
+
+grid <- expand.grid(
+  k      = k_grid,
+  family = families,
+  nc     = nc_grid,
+  rf     = rf_grid,
+  ra     = ra_grid,
+  stringsAsFactors = FALSE
+)
+
+meta_list <- vector("list", nrow(grid))
+
+for (i in seq_len(nrow(grid))) {
+  row <- grid[i, ]
+  out <- make_ccd(row$k, row$family, row$nc, row$rf, row$ra)
+  meta_list[[i]] <- out$meta
+  saveRDS(
+    out$points,
+    file.path("data_generated", paste0("design_", out$meta$DesignID, ".rds"))
+  )
+}
+
+design_metadata <- dplyr::bind_rows(meta_list)
+readr::write_csv(design_metadata, "data_generated/design_metadata.csv")
+cat("Total designs generated:", nrow(design_metadata), "\n")
+
+# --- 1B: Lambda grid search with scaled regularisation ---
+# Evaluate all designs at each lambda_base to identify the
+# regularisation level that maximises mean G-efficiency.
+# Note: actual lambda applied is lambda_base * p
+
+lambda_grid <- 10^seq(-10, -2, by = 1)
+
+meta <- readr::read_csv("data_generated/design_metadata.csv",
+                        show_col_types = FALSE) %>%
+  dplyr::mutate(DesignID = stringr::str_trim(DesignID))
+
+raw_list <- list()
+idx <- 1
+
+for (lam in lambda_grid) {
+  for (i in seq_len(nrow(meta))) {
+
+    id    <- meta$DesignID[i]
+    fpath <- file.path("data_generated", paste0("design_", id, ".rds"))
+    if (!file.exists(fpath)) next
+
+    pts  <- readRDS(fpath)
+    crit <- compute_ADG(pts, g_n = 5000, lambda = lam, scale_type = "trace")
+    if (is.null(crit)) next
+
+    raw_list[[idx]] <- tibble::tibble(
+      DesignID   = id,
+      lambda     = lam,
+      lambda_eff = crit$lambda_eff,
+      Dcrit      = crit$Dcrit,
+      Acrit      = crit$Acrit,
+      Gcrit      = crit$Gcrit
+    )
+    idx <- idx + 1
+  }
+}
+
+raw_by_lambda <- dplyr::bind_rows(raw_list)
+readr::write_csv(raw_by_lambda, "data_generated/raw_criteria_by_lambda.csv")
+
+# --- 1C: Convert raw criteria to within-k efficiencies ---
+# Efficiency is computed relative to the best design at each k,
+# so values are between 0 and 1 within each dimensional level.
+
+df_lam <- meta %>% dplyr::inner_join(raw_by_lambda, by = "DesignID")
+
+eff_by_lambda <- df_lam %>%
+  dplyr::group_by(lambda, k) %>%
+  dplyr::mutate(
+    Deff = Dcrit / max(Dcrit, na.rm = TRUE),
+    Aeff = min(Acrit, na.rm = TRUE) / Acrit,
+    Geff = min(Gcrit, na.rm = TRUE) / Gcrit
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(eff_by_lambda, "data_generated/eff_by_lambda.csv")
+
+# --- 1D: Select the best lambda ---
+# Best lambda is the value that maximises mean G-efficiency
+# across all designs, with D- and A-efficiency as tiebreakers.
+
+lam_summary <- eff_by_lambda %>%
+  dplyr::group_by(lambda) %>%
+  dplyr::summarise(
+    meanG = mean(Geff, na.rm = TRUE),
+    meanD = mean(Deff, na.rm = TRUE),
+    meanA = mean(Aeff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(meanG), desc(meanD), desc(meanA))
+
+readr::write_csv(lam_summary, "data_generated/lambda_summary.csv")
+
+best_lambda <- lam_summary$lambda[1]
+writeLines(as.character(best_lambda), "data_generated/best_lambda.txt")
+cat("Best base lambda selected:", best_lambda, "\n")
+cat("(Actual lambda applied = ", best_lambda, " * p for each design)\n", sep = "")
+
+# Main analysis dataframe used in all subsequent objectives
+df_all <- eff_by_lambda %>% dplyr::filter(lambda == best_lambda)
+readr::write_csv(df_all, "data_generated/df_all_best_lambda.csv")
+
+# --- 1E: Summary table and plots ---
+
+tab_eff_o1 <- df_all %>%
+  dplyr::group_by(k, family) %>%
+  dplyr::summarise(
+    meanD = mean(Deff, na.rm = TRUE),
+    meanA = mean(Aeff, na.rm = TRUE),
+    meanG = mean(Geff, na.rm = TRUE),
+    n     = dplyr::n(),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_eff_o1,
+  "results_tables/obj1_mean_efficiency_by_k_family.csv")
+
+# Family-level summary averaged over all k
+tab_family_avg <- tab_eff_o1 %>%
+  dplyr::group_by(family) %>%
+  dplyr::summarise(
+    avgD = mean(meanD),
+    avgA = mean(meanA),
+    avgG = mean(meanG),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_family_avg,
+  "results_tables/obj1_family_average_efficiency.csv")
+
+# Plot helper function
+plot_eff_line <- function(dat, ycol, ylab, outfile) {
+  p <- ggplot(dat,
+      aes(x = k, y = .data[[ycol]],
+          colour = family, linetype = family,
+          shape = family, group = family)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2.8) +
+    scale_x_continuous(breaks = 3:10) +
+    labs(
+      x        = "Number of factors (k)",
+      y        = ylab,
+      colour   = "CCD family",
+      linetype = "CCD family",
+      shape    = "CCD family"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "right",
+      legend.title    = element_text(face = "bold")
+    )
+  ggsave(outfile, p, width = 9, height = 5)
+  p
+}
+
+plot_eff_line(
+  tab_eff_o1, "meanG",
+  paste0("Mean Regularised G-efficiency (\u03BB = ", best_lambda, " \u00D7 mean(diag(X'X)))"),
+  "results_figures/obj1_Geff_k3to10.png"
+)
+
+plot_eff_line(
+  tab_eff_o1, "meanD",
+  paste0("Mean Regularised D-efficiency (\u03BB = ", best_lambda, " \u00D7 mean(diag(X'X)))"),
+  "results_figures/obj1_Deff_k3to10.png"
+)
+
+plot_eff_line(
+  tab_eff_o1, "meanA",
+  paste0("Mean Regularised A-efficiency (\u03BB = ", best_lambda, " \u00D7 mean(diag(X'X)))"),
+  "results_figures/obj1_Aeff_k3to10.png"
+)
+
+# Combined faceted plot for all three criteria
+tab_eff_long <- tab_eff_o1 %>%
+  tidyr::pivot_longer(
+    cols      = c(meanD, meanA, meanG),
+    names_to  = "criterion",
+    values_to = "meanEff"
+  ) %>%
+  dplyr::mutate(criterion = dplyr::recode(criterion,
+    meanD = "D-efficiency",
+    meanA = "A-efficiency",
+    meanG = "G-efficiency"
+  ))
+
+p_all_criteria <- ggplot(tab_eff_long,
+    aes(k, meanEff,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y") +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x        = "Number of factors (k)",
+    y        = paste0("Mean Efficiency (scaled \u03BB = ", best_lambda, " \u00D7 p)"),
+    colour   = "CCD family",
+    linetype = "CCD family",
+    shape    = "CCD family"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures/obj1_all_criteria_faceted.png",
+       p_all_criteria, width = 12, height = 5)
+
+cat("Objective 1 complete.\n")
+print(tab_eff_o1)
+
+
+# ============================================================
+# OBJECTIVE 2: SPECTRAL ANALYSIS OF CCD INFORMATION MATRICES
+#
+# For each design, eigenvalues of the regularised information
+# matrix M_lambda are extracted and summarised. Growth of the
+# condition number and log-determinant across dimensions is
+# modelled and plotted.
+#
+# Uses proper trace-based scaling: lambda_eff = lambda * tr(X'X) / p
+# ============================================================
+
+cat("\n=== OBJECTIVE 2: Spectral analysis ===\n")
+
+meta <- readr::read_csv("data_generated/design_metadata.csv",
+                        show_col_types = FALSE) %>%
+  dplyr::mutate(DesignID = stringr::str_trim(DesignID))
+
+df_all <- readr::read_csv("data_generated/df_all_best_lambda.csv",
+                          show_col_types = FALSE) %>%
+  dplyr::mutate(DesignID = stringr::str_trim(DesignID))
+
+# --- 2A: Compute spectral features for every design ---
+
+spec_list <- vector("list", nrow(meta))
+
+for (i in seq_len(nrow(meta))) {
+
+  id    <- meta$DesignID[i]
+  fpath <- file.path("data_generated", paste0("design_", id, ".rds"))
+  if (!file.exists(fpath)) next
+
+  pts  <- readRDS(fpath)
+  X    <- build_X_quadratic(pts)
+  p    <- ncol(X)
+  XtX  <- crossprod(X)
+ 
+  # Use proper trace-based scaling consistent with Objective 1
+  mean_diag  <- sum(diag(XtX)) / p
+  lambda_eff <- best_lambda * mean_diag
+  Mlam <- XtX + lambda_eff * diag(p)
+
+  ev <- sort(eigen(Mlam, symmetric = TRUE, only.values = TRUE)$values)
+  ev <- ev[is.finite(ev) & ev > 0]
+  if (length(ev) < 5) next
+
+  q <- quantile(ev, probs = c(0.1, 0.5, 0.9), names = FALSE)
+
+  spec_list[[i]] <- tibble::tibble(
+    DesignID   = id,
+    p          = p,
+    mean_diag  = mean_diag,
+    lambda_eff = lambda_eff,
+    eig_q10    = q[1],
+    eig_q50    = q[2],
+    eig_q90    = q[3],
+    eig_spread = q[3] / q[1],
+    min_eig    = min(ev),
+    max_eig    = max(ev),
+    condM      = max(ev) / min(ev),
+    logdetM    = sum(log(ev))
+  )
+}
+
+spec_data <- dplyr::bind_rows(spec_list)
+
+# Merge spectral features with efficiency data
+df_spec <- df_all %>%
+  dplyr::left_join(spec_data, by = "DesignID") %>%
+  dplyr::filter(!is.na(condM)) %>%
+  dplyr::mutate(log_cond = log(condM))
+
+readr::write_csv(df_spec,
+  "results_tables1/obj2_design_level_spectrum.csv")
+
+# --- 2B: Summary by (k, family) ---
+
+spec_summary <- df_spec %>%
+  dplyr::group_by(k, family) %>%
+  dplyr::summarise(
+    mean_p        = mean(p),
+    mean_mean_diag = mean(mean_diag),
+    mean_lam_eff  = mean(lambda_eff),
+    mean_condM    = mean(condM),
+    mean_logdetM  = mean(logdetM),
+    mean_min_eig  = mean(min_eig),
+    mean_q10      = mean(eig_q10),
+    mean_q50      = mean(eig_q50),
+    mean_q90      = mean(eig_q90),
+    mean_spread   = mean(eig_spread),
+    .groups = "drop"
+  )
+
+readr::write_csv(spec_summary,
+  "results_tables1/obj2_spectral_summary_by_k_family.csv")
+
+# --- 2C: Growth rate models ---
+# Fit log-linear models to capture how condition number and
+# log-determinant grow as a function of k for each family.
+
+growth_fits <- spec_summary %>%
+  dplyr::group_by(family) %>%
+  dplyr::do({
+    fc <- lm(log(mean_condM) ~ k, data = .)
+    fd <- lm(mean_logdetM   ~ k, data = .)
+    tibble::tibble(
+      cond_slope = coef(fc)[2],
+      cond_r2    = summary(fc)$r.squared,
+      det_slope  = coef(fd)[2],
+      det_r2     = summary(fd)$r.squared
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(growth_fits,
+  "results_tables1/obj2_spectral_growth_rates.csv")
+
+# --- 2D: Spectral plots ---
+
+# Eigenvalue quantile distribution across k and family
+spec_q_long <- spec_summary %>%
+  dplyr::select(k, family, mean_q10, mean_q50, mean_q90) %>%
+  tidyr::pivot_longer(-c(k, family),
+                      names_to  = "quantile",
+                      values_to = "value") %>%
+  dplyr::mutate(quantile = dplyr::recode(quantile,
+    mean_q10 = "10th Percentile",
+    mean_q50 = "Median",
+    mean_q90 = "90th Percentile"
+  ))
+
+p_eig <- ggplot(spec_q_long,
+    aes(k, value, colour = family, group = family)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~quantile, scales = "free_y") +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "Eigenvalue",
+    title  = "Eigenvalue Distribution of the Regularised Information Matrix (Scaled \u03BB)",
+    colour = "CCD family"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/obj2_eigenvalue_quantiles.png",
+       p_eig, width = 12, height = 5)
+
+# Condition number growth across dimensions
+p_cond <- ggplot(spec_summary,
+    aes(k, mean_condM, colour = family, group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = expression("Mean Condition Number " ~ kappa(M[lambda])),
+    title  = "Condition Number Growth Across Dimensions (Scaled \u03BB)",
+    colour = "CCD family"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/obj2_condition_number_growth.png",
+       p_cond, width = 9, height = 5)
+
+# Log-determinant growth across dimensions
+p_logdet <- ggplot(spec_summary,
+    aes(k, mean_logdetM, colour = family, group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = expression("Mean " ~ log ~ "|" ~ M[lambda] ~ "|"),
+    title  = "Log-Determinant Growth Across Dimensions (Scaled \u03BB)",
+    colour = "CCD family"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/obj2_logdet_growth.png",
+       p_logdet, width = 9, height = 5)
+
+# NEW: Plot showing effective lambda across dimensions
+# This demonstrates how trace-based scaling adapts to matrix magnitude
+p_lam_eff <- ggplot(spec_summary,
+    aes(k, mean_lam_eff, colour = family, group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = 3:10) +
+  scale_y_log10() +
+  labs(
+    x      = "Number of factors (k)",
+    y      = expression("Effective " ~ lambda ~ " = " ~ lambda[base] ~ " \u00D7 " ~ bar(diag(X*"'"*X))),
+    title  = "Trace-Scaled Regularisation Parameter Across Dimensions",
+    subtitle = "Regularisation adapts to information matrix magnitude",
+    colour = "CCD family"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures1/obj2_effective_lambda.png",
+       p_lam_eff, width = 9, height = 5)
+
+cat("Objective 2 complete.\n")
+
+
+# ============================================================
+# OBJECTIVE 3: CROSS-DIMENSIONAL STABILITY (CDS)
+#
+# CDS is formally defined as the variance of mean efficiency
+# across k = 3 to 10 for each design family and criterion.
+# Scaling law exponents are estimated from the log-log
+# relationship between mean efficiency and k.
+# ============================================================
+
+cat("\n=== OBJECTIVE 3: Cross-Dimensional Stability ===\n")
+
+stopifnot(exists("df_all"))
+
+eff_cols <- c("Deff", "Aeff", "Geff")
+miss <- setdiff(eff_cols, names(df_all))
+if (length(miss) > 0) {
+  stop("Missing efficiency columns in df_all: ", paste(miss, collapse = ", "))
+}
+
+df_obj3 <- df_all %>%
+  dplyr::mutate(k = as.integer(k), family = as.factor(family))
+
+# --- 3A: Reshape to long format ---
+
+eff_long <- df_obj3 %>%
+  dplyr::select(k, family, dplyr::all_of(eff_cols)) %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(eff_cols),
+    names_to  = "criterion",
+    values_to = "eff"
+  ) %>%
+  dplyr::mutate(
+    criterion = dplyr::recode(criterion,
+      Deff = "D", Aeff = "A", Geff = "G"),
+    criterion = factor(criterion, levels = c("D", "A", "G"))
+  )
+
+# --- 3B: Mean efficiency by (k, family, criterion) ---
+
+tab_mean_o3 <- eff_long %>%
+  dplyr::group_by(k, family, criterion) %>%
+  dplyr::summarise(
+    meanEff = mean(eff, na.rm = TRUE),
+    sdEff   = sd(eff,   na.rm = TRUE),
+    n       = sum(!is.na(eff)),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_mean_o3,
+  "results_tables2/obj3_mean_efficiency_by_k_family.csv")
+
+# --- 3C: CDS stability indices ---
+
+cds_summary <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::summarise(
+    CDS_variance   = var(meanEff,  na.rm = TRUE),
+    CDS_sd         = sd(meanEff,   na.rm = TRUE),
+    CDS_range      = max(meanEff)  - min(meanEff),
+    CDS_end_change = meanEff[k == max(k)][1] - meanEff[k == min(k)][1],
+    mean_over_k    = mean(meanEff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(cds_summary,
+  "results_tables2/obj3_CDS_stability_indices.csv")
+
+# --- 3D: Scaling law exponents with significance testing ---
+# Model: log(meanEff) = beta0 + beta1 * log(k)
+# beta1 is the scaling exponent indicating the rate and
+# direction of efficiency change with dimensional rise.
+
+scaling_exponents <- tab_mean_o3 %>%
+  dplyr::filter(meanEff > 0) %>%
+  dplyr::mutate(logEff = log(meanEff), logk = log(k)) %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::do({
+    fit <- lm(logEff ~ logk, data = .)
+    sm  <- summary(fit)
+    tibble::tibble(
+      beta0    = coef(fit)[["(Intercept)"]],
+      beta1    = coef(fit)[["logk"]],
+      SE_beta1 = sm$coefficients["logk", "Std. Error"],
+      t_stat   = sm$coefficients["logk", "t value"],
+      p_value  = sm$coefficients["logk", "Pr(>|t|)"],
+      R2       = sm$r.squared,
+      adj_R2   = sm$adj.r.squared,
+      sig      = dplyr::case_when(
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.001 ~ "***",
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.01  ~ "**",
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.05  ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(scaling_exponents,
+  "results_tables2/obj3_scaling_exponents.csv")
+
+cat("\n--- Scaling Exponents Table ---\n")
+print(scaling_exponents %>%
+        dplyr::select(family, criterion, beta1, SE_beta1, p_value, sig, R2))
+
+# --- 3E: Plots ---
+
+# Mean efficiency curves faceted by criterion
+p_curves <- ggplot(tab_mean_o3,
+    aes(k, meanEff,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.6) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "Mean Efficiency",
+    title  = "Cross-Dimensional Mean Efficiency Curves (Scaled \u03BB)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_mean_efficiency_curves.png",
+       p_curves, width = 12, height = 5)
+
+# Scaling exponents bar chart with significance labels
+p_beta <- ggplot(scaling_exponents,
+    aes(x = family, y = beta1, fill = family)) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = paste0(round(beta1, 3), "\n", sig)),
+    vjust = ifelse(scaling_exponents$beta1 >= 0, -0.3, 1.2),
+    size  = 3.5
+  ) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  labs(
+    x     = "CCD Family",
+    y     = expression(hat(beta)[1] ~ "(Scaling Exponent)"),
+    title = "Scaling Exponents with Significance Levels (Scaled \u03BB)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+ggsave("results_figures2/obj3_scaling_exponents.png",
+       p_beta, width = 11, height = 5)
+
+# CDS variance heatmap
+p_heat <- ggplot(cds_summary,
+    aes(x = criterion, y = family, fill = CDS_variance)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(CDS_variance, 4)), size = 3.5) +
+  scale_fill_gradient(low = "#d1e5f0", high = "#2166ac") +
+  labs(
+    x     = "Efficiency Criterion",
+    y     = "CCD Family",
+    fill  = "CDS Variance",
+    title = "Cross-Dimensional Stability Variance Heatmap (Scaled \u03BB)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures2/obj3_CDS_heatmap.png",
+       p_heat, width = 8, height = 5)
+
+cat("Objective 3 complete.\n")
+print(cds_summary)
+
+
+# ============================================================
+# OBJECTIVE 4: MACHINE LEARNING ANALYSIS
+#
+# This objective addresses: "Use machine learning to develop
+# models that connect the geometry and the spectrum to the
+# optimality criteria and see the effectiveness of the machine
+# learning model over the rise in the dimensions."
+#
+# The analysis is structured into TWO PARTS:
+#
+# PART A - STRUCTURAL PREDICTION (Practical Value)
+#   Question: Can we predict efficiency from design structure
+#             alone (k, family, nc, rf, ra) without computing
+#             the full information matrix?
+#   Purpose:  Provides practical guidance for design selection
+#   Expected: Moderate R² (0.5-0.8) indicating learnable patterns
+#
+# PART B - EXPLANATORY ANALYSIS (Scientific Value)
+#   Question: Which geometric and spectral features best explain
+#             efficiency variation? Does this change across dimensions?
+#   Purpose:  Understand the geometry→efficiency relationship
+#   Method:   Variable importance decomposition, not prediction
+#   Focus:    Feature rankings, not R² values
+#
+# Models evaluated:
+#   1. Linear Regression (baseline, interpretable coefficients)
+#   2. Random Forest (importance via permutation)
+#   3. XGBoost (importance via gain)
+#   4. Support Vector Regression (SVR, RBF kernel)
+#   5. K-Nearest Neighbours Regression (KNN)
+#   6. Decision Tree (CART, visual interpretation)
+#
+# All models use an 80/20 random train/test split.
+# Effectiveness is examined across dimensional bands:
+#   Low (k = 3 to 6) and High (k = 7 to 10).
+# ============================================================
+
+cat("\n=== OBJECTIVE 4: Machine Learning Analysis ===\n")
+
+# --- 4A: Load spectral dataset and define predictor sets ---
+
+df_spec <- readr::read_csv(
+  "results_tables1/obj2_design_level_spectrum.csv",
+  show_col_types = FALSE
+)
+
+# PART A predictors: Structural/geometric features only
+# These are design choices available BEFORE computing the information matrix
+Xvars_structural <- c(
+  Xvars_structural <- c(
+  "k",       # number of factors (chosen)
+  "family",  # FCCD/RCCD/SCCD (chosen) — encode as dummy
+  "nc",      # centre points (chosen)
+  "rf",      # factorial replication (chosen)
+  "ra"       # axial replication (chosen)
+)
+
+# PART B predictors: Full feature set including spectral properties
+# NOTE: Spectral features are derived from the same information matrix
+# used to compute efficiency, so high R² is expected and NOT the goal.
+# The goal is to understand WHICH features explain efficiency variation.
+```
+
+```{r}
+Xvars_full <- c(
+  # Structural (geometric) features
+  "k", "nc", "rf", "ra", "family_RCCD", "family_SCCD",
+  # Derived structural (included for completeness)
+  "alpha", "N", "Nf", "Na", "Nc",
+  # Matrix dimension
+  "p",
+  # Regularisation (scaled)
+  "mean_diag", "lambda_eff",
+  # Spectral features (eigenvalue distribution)
+  "log_cond",    # log condition number - measures ill-conditioning
+  "min_eig",     # minimum eigenvalue - estimation precision floor
+  "logdetM",     # log determinant - D-efficiency related
+  "eig_spread",  # ratio of extreme eigenvalues
+  "eig_q10",     # 10th percentile eigenvalue
+  "eig_q50",     # median eigenvalue
+  "eig_q90"      # 90th percentile eigenvalue
+)
+
+Xvars_structural <- Xvars_structural[Xvars_structural %in% names(df_spec)]
+Xvars_full <- Xvars_full[Xvars_full %in% names(df_spec)]
+
+cat("\n--- Predictor Sets Defined ---\n")
+cat("STRUCTURAL predictors (Part A):", length(Xvars_structural), "variables\n")
+cat("  ", paste(Xvars_structural, collapse = ", "), "\n")
+cat("FULL predictors (Part B):", length(Xvars_full), "variables\n")
+cat("  ", paste(Xvars_full, collapse = ", "), "\n")
+
+# ============================================================
+# run_ml_pipeline()
+# Trains and evaluates all six ML models for a given response
+# variable. Returns fitted models and metrics for downstream use.
+# ============================================================
+
+run_ml_pipeline <- function(response_var, df, Xvars,
+                            outdir_fig, outdir_tab,
+                            response_label) {
+
+  cat("\n-- Response:", response_label, "--\n")
+
+  model_df <- df %>%
+    dplyr::filter(complete.cases(
+      dplyr::across(dplyr::all_of(c(Xvars, response_var)))))
+
+  cat("Observations available:", nrow(model_df), "\n")
+
+  # --- 80/20 random train/test split ---
+  set.seed(6)
+  idx   <- sample(seq_len(nrow(model_df)), floor(0.8 * nrow(model_df)))
+  train <- model_df[idx, ]
+  test  <- model_df[-idx, ]
+
+  x_train <- as.matrix(train[, Xvars])
+  x_test  <- as.matrix(test[, Xvars])
+  y_train <- train[[response_var]]
+  y_test  <- test[[response_var]]
+
+  # Scaled predictor matrices for distance-based models (SVR, KNN)
+  sc       <- scale(x_train)
+  x_sc_tr  <- sc
+  x_sc_te  <- scale(x_test,
+                    center = attr(sc, "scaled:center"),
+                    scale  = attr(sc, "scaled:scale"))
+
+  metrics_out <- list()
+
+  # ----------------------------------------------------------
+  # MODEL 1: Linear Regression (Baseline)
+  # Fits an ordinary least squares model assuming a linear
+  # additive relationship between predictors and efficiency.
+  # ----------------------------------------------------------
+  fit1  <- lm(
+    as.formula(paste(response_var, "~ .")),
+    data = train[, c(response_var, Xvars)]
+  )
+  pred1 <- predict(fit1, newdata = test)
+  m1    <- reg_metrics(y_test, pred1)
+  metrics_out[["LinearRegression"]] <- data.frame(
+    Model = "Linear Regression", RMSE = m1["RMSE"], R2 = m1["R2"]
+  )
+  save_obs_pred(y_test, pred1,
+                paste("Linear Regression", response_label), outdir_fig)
+
+  # ----------------------------------------------------------
+  # MODEL 2: Random Forest
+  # An ensemble of 800 decision trees trained on random
+  # subsets of observations and predictors. Final prediction
+  # is the average across all trees. Permutation importance
+  # is computed to identify influential predictors.
+  # ----------------------------------------------------------
+  fit2  <- ranger::ranger(
+    as.formula(paste(response_var, "~ .")),
+    data       = train[, c(response_var, Xvars)],
+    num.trees  = 800,
+    importance = "permutation"
+  )
+  pred2 <- predict(fit2, data = test[, Xvars])$predictions
+  m2    <- reg_metrics(y_test, pred2)
+  metrics_out[["RandomForest"]] <- data.frame(
+    Model = "Random Forest", RMSE = m2["RMSE"], R2 = m2["R2"]
+  )
+  save_obs_pred(y_test, pred2,
+                paste("Random Forest", response_label), outdir_fig)
+
+  p_rf_imp <- vip::vip(fit2, num_features = 12) +
+    ggtitle(paste("Random Forest Variable Importance:", response_label))
+  ggsave(
+    file.path(outdir_fig,
+              paste0("importance_RF_", response_var, ".png")),
+    p_rf_imp, width = 8, height = 5
+  )
+
+  # ----------------------------------------------------------
+  # MODEL 3: XGBoost
+  # Gradient boosted trees trained sequentially, where each
+  # tree corrects the residual errors of the previous ensemble.
+  # Parameters: max_depth = 5, learning rate = 0.06,
+  # subsampling = 0.80, column sampling = 0.80, 600 rounds.
+  # ----------------------------------------------------------
+  dtrain     <- xgboost::xgb.DMatrix(data = x_train, label = y_train)
+  dtest      <- xgboost::xgb.DMatrix(data = x_test,  label = y_test)
+  xgb_params <- list(
+    objective        = "reg:squarederror",
+    eval_metric      = "rmse",
+    max_depth        = 5,
+    eta              = 0.06,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  )
+  fit3  <- xgboost::xgb.train(xgb_params, dtrain,
+                               nrounds = 600, verbose = 0)
+  pred3 <- predict(fit3, dtest)
+  m3    <- reg_metrics(y_test, pred3)
+  metrics_out[["XGBoost"]] <- data.frame(
+    Model = "XGBoost", RMSE = m3["RMSE"], R2 = m3["R2"]
+  )
+  save_obs_pred(y_test, pred3,
+                paste("XGBoost", response_label), outdir_fig)
+
+  imp_xgb   <- xgboost::xgb.importance(model = fit3)
+  p_xgb_imp <- ggplot(head(imp_xgb, 12),
+      aes(reorder(Feature, Gain), Gain)) +
+    geom_col() + coord_flip() +
+    labs(x = "Feature", y = "Gain",
+         title = paste("XGBoost Variable Importance:", response_label)) +
+    theme_minimal(base_size = 13)
+  ggsave(
+    file.path(outdir_fig,
+              paste0("importance_XGB_", response_var, ".png")),
+    p_xgb_imp, width = 8, height = 5
+  )
+
+  # Store fitted XGBoost model in global environment for
+  # combined importance plot produced after all pipelines run
+  assign(paste0("xgb_fit_", response_var), fit3, envir = .GlobalEnv)
+
+  # ----------------------------------------------------------
+  # MODEL 4: Support Vector Regression (SVR, RBF kernel)
+  # Fits a regression function within an epsilon-insensitive
+  # tube using a radial basis function kernel to capture
+  # nonlinear relationships. Requires standardised inputs.
+  # ----------------------------------------------------------
+  fit4  <- e1071::svm(
+    x      = x_sc_tr,
+    y      = y_train,
+    type   = "eps-regression",
+    kernel = "radial"
+  )
+  pred4 <- predict(fit4, x_sc_te)
+  m4    <- reg_metrics(y_test, pred4)
+  metrics_out[["SVR"]] <- data.frame(
+    Model = "SVR (RBF kernel)", RMSE = m4["RMSE"], R2 = m4["R2"]
+  )
+  save_obs_pred(y_test, pred4,
+                paste("SVR", response_label), outdir_fig)
+
+  # ----------------------------------------------------------
+  # MODEL 5: K-Nearest Neighbours Regression (KNN, k = 10)
+  # Predicts efficiency as the average of the 10 most similar
+  # training designs, where similarity is measured by
+  # Euclidean distance in the standardised predictor space.
+  # ----------------------------------------------------------
+  fit5  <- FNN::knn.reg(
+    train = x_sc_tr, test = x_sc_te, y = y_train, k = 10
+  )
+  pred5 <- fit5$pred
+  m5    <- reg_metrics(y_test, pred5)
+  metrics_out[["KNN"]] <- data.frame(
+    Model = "KNN (k = 10)", RMSE = m5["RMSE"], R2 = m5["R2"]
+  )
+  save_obs_pred(y_test, pred5,
+                paste("KNN", response_label), outdir_fig)
+
+  # ----------------------------------------------------------
+  # MODEL 6: Decision Tree (CART)
+  # Fits a single regression tree that recursively partitions
+  # the predictor space using binary splits selected to
+  # minimise within-node variance. Tree depth is controlled
+  # by cost-complexity pruning (cp = 0.001).
+  # ----------------------------------------------------------
+  fit6  <- rpart::rpart(
+    as.formula(paste(response_var, "~ .")),
+    data    = train[, c(response_var, Xvars)],
+    method  = "anova",
+    control = rpart::rpart.control(cp = 0.001, maxdepth = 10)
+  )
+  pred6 <- predict(fit6, newdata = test)
+  m6    <- reg_metrics(y_test, pred6)
+  metrics_out[["DecisionTree"]] <- data.frame(
+    Model = "Decision Tree", RMSE = m6["RMSE"], R2 = m6["R2"]
+  )
+  save_obs_pred(y_test, pred6,
+                paste("Decision Tree", response_label), outdir_fig)
+
+  # Decision tree plot
+  png(
+    file.path(outdir_fig,
+              paste0("tree_plot_", response_var, ".png")),
+    width = 1200, height = 800
+  )
+  rpart.plot::rpart.plot(fit6, type = 4, extra = 101,
+                         main = paste("Decision Tree:", response_label))
+  dev.off()
+
+  # --- Compile and save metrics table ---
+  metrics_tbl <- dplyr::bind_rows(metrics_out) %>%
+    dplyr::mutate(
+      Response = response_label,
+      n_train  = nrow(train),
+      n_test   = nrow(test),
+      n_predictors = length(Xvars)
+    ) %>%
+    dplyr::arrange(RMSE)
+
+  readr::write_csv(
+    metrics_tbl,
+    file.path(outdir_tab,
+              paste0("obj4_ML_metrics_", response_var, ".csv"))
+  )
+
+  cat("Results for", response_label, ":\n")
+  print(metrics_tbl[, c("Model", "RMSE", "R2")])
+
+  # Return fitted models for use in dimensional band analysis
+  list(
+    metrics  = metrics_tbl,
+    train_df = train,
+    test_df  = test,
+    best_rf  = fit2,
+    best_xgb = fit3,
+    lm_fit   = fit1
+  )
+}
+
+
+# ============================================================
+# PART A: STRUCTURAL PREDICTION
+# ============================================================
+# Question: Can we predict efficiency from design structure
+#           alone (k, family, nc, rf, ra, alpha) without
+#           computing the full information matrix?
+#
+# This has PRACTICAL VALUE: if R² is reasonable (0.5-0.8),
+# practitioners can estimate efficiency without expensive
+# matrix computations.
+#
+# Expected R²: MODERATE (0.4-0.7) - this is the DESIRED outcome
+# showing that structural choices meaningfully predict efficiency.
+# ============================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("PART A: STRUCTURAL PREDICTION (Practical Value)\n")
+cat("Predictors: Design structure only (k, nc, rf, ra, alpha, N)\n")
+cat("Goal: Moderate R² showing learnable structure→efficiency patterns\n")
+cat(rep("=", 60), "\n", sep = "")
+
+res_G_struct <- run_ml_pipeline(
+  "Geff", df_spec, Xvars_structural,
+  "results_figures4", "results_tables4",
+  "G-efficiency (Structural)"
+)
+
+res_A_struct <- run_ml_pipeline(
+  "Aeff", df_spec, Xvars_structural,
+  "results_figures4", "results_tables4",
+  "A-efficiency (Structural)"
+)
+
+res_D_struct <- run_ml_pipeline(
+  "Deff", df_spec, Xvars_structural,
+  "results_figures4", "results_tables4",
+  "D-efficiency (Structural)"
+)
+
+# Combined structural metrics
+all_metrics_struct <- dplyr::bind_rows(
+  res_G_struct$metrics,
+  res_A_struct$metrics,
+  res_D_struct$metrics
+) %>%
+  dplyr::mutate(Analysis = "Structural")
+
+readr::write_csv(all_metrics_struct,
+  "results_tables4/obj4_PART_A_structural_metrics.csv")
+
+
+# ============================================================
+# PART B: EXPLANATORY ANALYSIS (Scientific Value)
+# ============================================================
+# Question: Which geometric and spectral features best explain
+#           efficiency variation? Does this change across dimensions?
+#
+# METHOD: Variable importance analysis (NOT prediction accuracy)
+#
+# We fit models to extract IMPORTANCE RANKINGS, not to evaluate
+# predictive performance. R² is deliberately NOT reported because:
+#   1. Spectral features are derived from the same matrix as efficiency
+#   2. High R² is mathematically expected and uninformative
+#   3. The scientific question is "which features matter?", not "how well?"
+#
+# KEY OUTPUTS:
+#   - Feature importance rankings for each efficiency criterion
+#   - Category decomposition (structural vs spectral importance)
+#   - Dimensional comparison (do rankings change at high-k?)
+# ============================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("PART B: EXPLANATORY ANALYSIS (Scientific Value)\n")
+cat("Predictors: Full feature set (structural + spectral)\n")
+cat("Goal: Identify WHICH features explain efficiency variation\n")
+cat("Method: Variable importance analysis (R² not reported)\n")
+cat(rep("=", 60), "\n", sep = "")
+
+# Fit models to extract importance (not for prediction evaluation)
+# We use a simplified pipeline that only returns importance data
+
+fit_for_importance <- function(response_var, df, Xvars, response_label) {
+ 
+  cat("\n-- Fitting models for importance:", response_label, "--\n")
+ 
+  model_df <- df %>%
+    dplyr::filter(complete.cases(
+      dplyr::across(dplyr::all_of(c(Xvars, response_var)))))
+ 
+  set.seed(6)
+  idx   <- sample(seq_len(nrow(model_df)), floor(0.8 * nrow(model_df)))
+  train <- model_df[idx, ]
+ 
+  x_train <- as.matrix(train[, Xvars])
+  y_train <- train[[response_var]]
+ 
+  # Random Forest for permutation importance
+  fit_rf <- ranger::ranger(
+    as.formula(paste(response_var, "~ .")),
+    data       = train[, c(response_var, Xvars)],
+    num.trees  = 800,
+    importance = "permutation"
+  )
+ 
+  # XGBoost for gain-based importance
+  dtrain <- xgboost::xgb.DMatrix(data = x_train, label = y_train)
+  xgb_params <- list(
+    objective        = "reg:squarederror",
+    max_depth        = 5,
+    eta              = 0.06,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  )
+  fit_xgb <- xgboost::xgb.train(xgb_params, dtrain, nrounds = 600, verbose = 0)
+ 
+  # Linear model for coefficient interpretation
+  fit_lm <- lm(
+    as.formula(paste(response_var, "~ .")),
+    data = train[, c(response_var, Xvars)]
+  )
+ 
+  list(
+    rf  = fit_rf,
+    xgb = fit_xgb,
+    lm  = fit_lm,
+    response = response_label,
+    train = train
+  )
+}
+
+# Fit models for all three responses
+imp_G <- fit_for_importance("Geff", df_spec, Xvars_full, "G-efficiency")
+imp_A <- fit_for_importance("Aeff", df_spec, Xvars_full, "A-efficiency")
+imp_D <- fit_for_importance("Deff", df_spec, Xvars_full, "D-efficiency")
+
+cat("\nModels fitted. Extracting importance rankings...\n")
+
+
+# ============================================================
+# PART A SUMMARY: Structural Prediction Results
+# ============================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("PART A RESULTS: STRUCTURAL PREDICTION\n")
+cat(rep("=", 60), "\n", sep = "")
+
+# Summary table for structural models
+struct_summary <- all_metrics_struct %>%
+  dplyr::filter(Model %in% c("Random Forest", "XGBoost")) %>%
+  dplyr::select(Response, Model, R2, RMSE) %>%
+  dplyr::mutate(
+    Interpretation = dplyr::case_when(
+      R2 > 0.7 ~ "Strong: Structure highly predictive",
+      R2 > 0.5 ~ "Moderate: Structure useful for screening",
+      R2 > 0.3 ~ "Weak: Structure provides some signal",
+      TRUE ~ "Poor: Matrix computation required"
+    )
+  )
+
+readr::write_csv(struct_summary,
+  "results_tables4/obj4_PART_A_summary.csv")
+
+cat("\nStructural Prediction Summary:\n")
+print(struct_summary)
+
+# Structural prediction plot
+p_struct_r2 <- struct_summary %>%
+  ggplot(aes(x = Response, y = R2, fill = Model)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "red") +
+  geom_hline(yintercept = 0.7, linetype = "dashed", colour = "darkgreen") +
+  annotate("text", x = 0.5, y = 0.52, label = "Moderate threshold",
+           hjust = 0, size = 3, colour = "red") +
+  annotate("text", x = 0.5, y = 0.72, label = "Strong threshold",
+           hjust = 0, size = 3, colour = "darkgreen") +
+  scale_fill_manual(values = c("Random Forest" = "#2166ac", "XGBoost" = "#b2182b")) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x     = "Efficiency Criterion",
+    y     = expression(R^2),
+    title = "PART A: Can We Predict Efficiency from Design Structure Alone?",
+    subtitle = "Predictors: k, nc, rf, ra, alpha, N (no matrix computation required)",
+    fill  = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures4/obj4_PART_A_structural_R2.png",
+       p_struct_r2, width = 10, height = 6)
+
+
+# ============================================================
+# OBJECTIVE 4 — DIMENSIONAL BAND ANALYSIS (Part A Focus)
+# ============================================================
+# Examines how STRUCTURAL prediction accuracy changes across:
+#   Low dimensions:  k = 3 to 6
+#   High dimensions: k = 7 to 10
+#
+# Key question: Does structural prediction degrade at high k?
+# If so, matrix computation becomes necessary for high-dimensional designs.
+# ============================================================
+
+cat("\n--- Dimensional Band Analysis (Structural Models) ---\n")
+
+run_dimensional_effectiveness <- function(response_var, df, Xvars,
+                                          fitted_rf, fitted_xgb,
+                                          response_label) {
+
+  model_df <- df %>%
+    dplyr::filter(complete.cases(
+      dplyr::across(dplyr::all_of(c(Xvars, response_var))))) %>%
+    dplyr::mutate(
+      dim_band = dplyr::case_when(
+        k <= 6 ~ "Low (k = 3-6)",
+        k >= 7 ~ "High (k = 7-10)"
+      ),
+      dim_band = factor(dim_band,
+                        levels = c("Low (k = 3-6)", "High (k = 7-10)"))
+    )
+
+  # Use the same global 80/20 split as the main pipeline
+  set.seed(6)
+  idx  <- sample(seq_len(nrow(model_df)), floor(0.8 * nrow(model_df)))
+  test <- model_df[-idx, ]
+
+  band_results <- list()
+
+  for (band in levels(model_df$dim_band)) {
+
+    test_band <- test %>% dplyr::filter(dim_band == band)
+    if (nrow(test_band) < 5) next
+
+    x_band <- as.matrix(test_band[, Xvars])
+    y_band <- test_band[[response_var]]
+
+    # Predict using the already-fitted models — no refitting
+    pred_rf  <- predict(fitted_rf,
+                        data = test_band[, Xvars])$predictions
+    pred_xgb <- predict(fitted_xgb,
+                        xgboost::xgb.DMatrix(data = x_band))
+
+    m_rf  <- reg_metrics(y_band, pred_rf)
+    m_xgb <- reg_metrics(y_band, pred_xgb)
+
+    band_results[[band]] <- tibble::tibble(
+      Response = response_label,
+      Band     = band,
+      n_test   = nrow(test_band),
+      RF_RMSE  = round(m_rf["RMSE"],  4),
+      RF_R2    = round(m_rf["R2"],    4),
+      XGB_RMSE = round(m_xgb["RMSE"], 4),
+      XGB_R2   = round(m_xgb["R2"],   4)
+    )
+  }
+
+  dplyr::bind_rows(band_results)
+}
+
+# --- Run dimensional band analysis for STRUCTURAL models ---
+cat("\n--- Dimensional Band Analysis: STRUCTURAL Models ---\n")
+
+dim_eff_G_struct <- run_dimensional_effectiveness(
+  "Geff", df_spec, Xvars_structural,
+  fitted_rf  = res_G_struct$best_rf,
+  fitted_xgb = res_G_struct$best_xgb,
+  response_label = "G-efficiency"
+) %>% dplyr::mutate(Analysis = "Structural")
+
+dim_eff_A_struct <- run_dimensional_effectiveness(
+  "Aeff", df_spec, Xvars_structural,
+  fitted_rf  = res_A_struct$best_rf,
+  fitted_xgb = res_A_struct$best_xgb,
+  response_label = "A-efficiency"
+)
+
+dim_eff_D_struct <- run_dimensional_effectiveness(
+  "Deff", df_spec, Xvars_structural,
+  fitted_rf  = res_D_struct$best_rf,
+  fitted_xgb = res_D_struct$best_xgb,
+  response_label = "D-efficiency"
+)
+
+dim_eff_struct <- dplyr::bind_rows(
+  dim_eff_G_struct, dim_eff_A_struct, dim_eff_D_struct
+)
+
+readr::write_csv(dim_eff_struct,
+  "results_tables4/obj4_dimensional_band_STRUCTURAL.csv")
+
+cat("\n=== Structural Prediction Across Dimensional Bands ===\n")
+print(dim_eff_struct)
+
+# Key plot: Does structural prediction degrade at high dimensions?
+dim_plot_long <- dim_eff_struct %>%
+  tidyr::pivot_longer(
+    cols      = c(RF_R2, XGB_R2),
+    names_to  = "model",
+    values_to = "R2"
+  ) %>%
+  dplyr::mutate(model = dplyr::recode(model,
+    RF_R2  = "Random Forest",
+    XGB_R2 = "XGBoost"
+  ))
+
+# Main dimensional band plot for structural prediction
+p_dim_struct <- ggplot(dim_plot_long,
+    aes(x = Band, y = R2,
+        colour = model, group = model, shape = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3.5) +
+  facet_wrap(~Response) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50", alpha = 0.7) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  scale_colour_manual(values = c("Random Forest" = "#2166ac", "XGBoost" = "#b2182b")) +
+  labs(
+    x      = "Dimensional Band",
+    y      = expression(R^2 ~ "(Test Set)"),
+    title  = "Part A: Does Structural Prediction Degrade at High Dimensions?",
+    subtitle = "Predictors: Design structure only (k, nc, rf, ra, alpha, N)",
+    colour = "Model",
+    shape  = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 15, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave("results_figures4/obj4_PART_A_dimensional_bands.png",
+       p_dim_struct, width = 12, height = 5)
+
+ggsave("results_figures4/obj4_PART_A_RMSE_dimensional_bands.png",
+       p_rmse_eff, width = 12, height = 5)
+
+
+# ============================================================
+# VARIABLE IMPORTANCE ANALYSIS
+# ============================================================
+# This is the SCIENTIFIC CONTRIBUTION of Part B:
+# Understanding which features explain efficiency variation.
+
+reorder_within <- function(x, by, within, sep = "___") {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = mean)
+}
+
+scale_x_reordered <- function(..., sep = "___") {
+  ggplot2::scale_x_discrete(
+    labels = function(x) sub(paste0(sep, ".*$"), "", x), ...)
+}
+
+get_xgb_imp <- function(model, label) {
+  xgboost::xgb.importance(model = model) %>%
+    dplyr::transmute(
+      Response  = label,
+      Feature   = Feature,
+      Gain      = Gain
+    ) %>%
+    dplyr::mutate(Gain_norm = Gain / sum(Gain, na.rm = TRUE))
+}
+
+# --- STRUCTURAL model importance (Part A) ---
+cat("\n--- Variable Importance: STRUCTURAL Models ---\n")
+
+imp_struct <- dplyr::bind_rows(
+  get_xgb_imp(res_G_struct$best_xgb, "G-efficiency") %>%
+    dplyr::mutate(Analysis = "Structural"),
+  get_xgb_imp(res_A_struct$best_xgb, "A-efficiency") %>%
+    dplyr::mutate(Analysis = "Structural"),
+  get_xgb_imp(res_D_struct$best_xgb, "D-efficiency") %>%
+    dplyr::mutate(Analysis = "Structural")
+)
+
+readr::write_csv(imp_struct,
+  "results_tables4/obj4_XGB_importance_STRUCTURAL.csv")
+
+p_imp_struct <- imp_struct %>%
+  dplyr::group_by(Response) %>%
+  dplyr::slice_max(Gain_norm, n = 8, with_ties = FALSE) %>%
+  dplyr::mutate(Feature = reorder_within(Feature, Gain_norm, Response)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = Feature, y = Gain_norm)) +
+  geom_col(fill = "#2166ac") +
+  coord_flip() +
+  facet_wrap(~Response, scales = "free_y") +
+  scale_x_reordered() +
+  labs(
+    x     = "Structural Predictor",
+    y     = "Normalised XGBoost Gain",
+    title = "STRUCTURAL Model: Which Design Choices Predict Efficiency?",
+    subtitle = "These features are available before computing the information matrix"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures4/obj4_XGB_importance_STRUCTURAL.png",
+       p_imp_struct, width = 12, height = 6)
+
+
+# --- FULL model importance (Part B) ---
+cat("\n--- Variable Importance: FULL Models (Part B) ---\n")
+cat("This is the SCIENTIFIC CONTRIBUTION: Which features explain efficiency?\n")
+
+imp_full <- dplyr::bind_rows(
+  get_xgb_imp(imp_G$xgb, "G-efficiency"),
+  get_xgb_imp(imp_A$xgb, "A-efficiency"),
+  get_xgb_imp(imp_D$xgb, "D-efficiency")
+)
+
+readr::write_csv(imp_full,
+  "results_tables4/obj4_XGB_importance_FULL.csv")
+
+# Categorise features for interpretation
+imp_full_cat <- imp_full %>%
+  dplyr::mutate(
+    Category = dplyr::case_when(
+      Feature %in% c("k", "nc", "rf", "ra", "alpha", "N", "Nf", "Na", "Nc") ~ "Structural",
+      Feature %in% c("p", "mean_diag", "lambda_eff") ~ "Matrix Scale",
+      Feature %in% c("log_cond", "min_eig", "logdetM", "eig_spread",
+                     "eig_q10", "eig_q50", "eig_q90") ~ "Spectral",
+      TRUE ~ "Other"
+    )
+  )
+
+readr::write_csv(imp_full_cat,
+  "results_tables4/obj4_XGB_importance_FULL_categorised.csv")
+
+# Category-level summary
+cat_summary <- imp_full_cat %>%
+  dplyr::group_by(Response, Category) %>%
+  dplyr::summarise(
+    total_importance = sum(Gain_norm, na.rm = TRUE),
+    n_features = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(names_from = Category, values_from = c(total_importance, n_features))
+
+readr::write_csv(cat_summary,
+  "results_tables4/obj4_importance_by_category.csv")
+
+cat("\n--- Importance by Feature Category ---\n")
+print(cat_summary)
+
+p_imp_full <- imp_full_cat %>%
+  dplyr::group_by(Response) %>%
+  dplyr::slice_max(Gain_norm, n = 10, with_ties = FALSE) %>%
+  dplyr::mutate(Feature = reorder_within(Feature, Gain_norm, Response)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = Feature, y = Gain_norm, fill = Category)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~Response, scales = "free_y") +
+  scale_x_reordered() +
+  scale_fill_manual(values = c(
+    "Structural" = "#2166ac",
+    "Matrix Scale" = "#92c5de",
+    "Spectral" = "#b2182b"
+  )) +
+  labs(
+    x     = "Predictor",
+    y     = "Normalised XGBoost Gain",
+    title = "FULL Model: Which Features Explain Efficiency Variation?",
+    subtitle = "Colour indicates feature category (Structural vs Spectral)",
+    fill  = "Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures4/obj4_XGB_importance_FULL.png",
+       p_imp_full, width = 12, height = 6)
+
+# Category importance bar chart
+p_cat_imp <- imp_full_cat %>%
+  dplyr::group_by(Response, Category) %>%
+  dplyr::summarise(total_importance = sum(Gain_norm), .groups = "drop") %>%
+  ggplot(aes(x = Response, y = total_importance, fill = Category)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c(
+    "Structural" = "#2166ac",
+    "Matrix Scale" = "#92c5de",
+    "Spectral" = "#b2182b"
+  )) +
+  labs(
+    x     = "Efficiency Criterion",
+    y     = "Total Feature Importance",
+    title = "Importance Decomposition by Feature Category",
+    subtitle = "How much do structural vs spectral features explain?",
+    fill  = "Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures4/obj4_importance_by_category.png",
+       p_cat_imp, width = 10, height = 6)
+
+
+# ============================================================
+# PART B: DIMENSIONAL IMPORTANCE ANALYSIS
+# ============================================================
+# Key question: Do importance rankings change from low-k to high-k?
+# This addresses whether the geometry→efficiency relationship
+# is stable across dimensions.
+
+cat("\n--- Importance Analysis by Dimensional Band ---\n")
+
+# Fit separate models for low-k and high-k subsets
+fit_importance_by_band <- function(df, Xvars, band_label, k_range) {
+ 
+  df_band <- df %>%
+    dplyr::filter(k >= k_range[1], k <= k_range[2]) %>%
+    dplyr::filter(complete.cases(dplyr::across(dplyr::all_of(c(Xvars, "Geff", "Aeff", "Deff")))))
+ 
+  if (nrow(df_band) < 50) return(NULL)
+ 
+  results <- list()
+ 
+  for (resp in c("Geff", "Aeff", "Deff")) {
+    set.seed(6)
+    x_mat <- as.matrix(df_band[, Xvars])
+    y_vec <- df_band[[resp]]
+   
+    dtrain <- xgboost::xgb.DMatrix(data = x_mat, label = y_vec)
+    xgb_params <- list(
+      objective = "reg:squarederror",
+      max_depth = 5, eta = 0.06,
+      subsample = 0.8, colsample_bytree = 0.8
+    )
+    fit_xgb <- xgboost::xgb.train(xgb_params, dtrain, nrounds = 400, verbose = 0)
+   
+    imp <- xgboost::xgb.importance(model = fit_xgb) %>%
+      dplyr::transmute(
+        Response = gsub("eff", "-efficiency", resp),
+        Feature = Feature,
+        Gain = Gain,
+        Band = band_label
+      ) %>%
+      dplyr::mutate(Gain_norm = Gain / sum(Gain))
+   
+    results[[resp]] <- imp
+  }
+ 
+  dplyr::bind_rows(results)
+}
+
+imp_low_k  <- fit_importance_by_band(df_spec, Xvars_full, "Low (k=3-6)", c(3, 6))
+imp_high_k <- fit_importance_by_band(df_spec, Xvars_full, "High (k=7-10)", c(7, 10))
+
+imp_by_band <- dplyr::bind_rows(imp_low_k, imp_high_k)
+
+readr::write_csv(imp_by_band,
+  "results_tables4/obj4_importance_by_dimensional_band.csv")
+
+# Compare top features across bands
+top_by_band <- imp_by_band %>%
+  dplyr::group_by(Response, Band) %>%
+  dplyr::slice_max(Gain_norm, n = 5, with_ties = FALSE) %>%
+  dplyr::mutate(rank = row_number()) %>%
+  dplyr::ungroup()
+
+readr::write_csv(top_by_band,
+  "results_tables4/obj4_top_features_by_band.csv")
+
+cat("\nTop 5 Features by Dimensional Band:\n")
+print(top_by_band %>%
+        dplyr::select(Response, Band, rank, Feature, Gain_norm) %>%
+        tidyr::pivot_wider(names_from = Band, values_from = c(Feature, Gain_norm)))
+
+# Plot: Importance shift across dimensions
+p_band_imp <- imp_by_band %>%
+  dplyr::group_by(Response, Band) %>%
+  dplyr::slice_max(Gain_norm, n = 6, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = reorder(Feature, Gain_norm), y = Gain_norm, fill = Band)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_wrap(~Response, scales = "free_y") +
+  scale_fill_manual(values = c("Low (k=3-6)" = "#2166ac", "High (k=7-10)" = "#b2182b")) +
+  labs(
+    x     = "Feature",
+    y     = "Normalised Importance",
+    title = "Part B: How Does Feature Importance Change Across Dimensions?",
+    subtitle = "Comparing low-dimensional (k=3-6) vs high-dimensional (k=7-10) designs",
+    fill  = "Dimensional Band"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures4/obj4_PART_B_importance_by_dimension.png",
+       p_band_imp, width = 14, height = 7)
+
+cat("\nObjective 4 complete.\n")
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+cat("\n")
+cat(rep("=", 70), "\n", sep = "")
+cat("ALL OBJECTIVES COMPLETE\n")
+cat(rep("=", 70), "\n", sep = "")
+
+cat("\nREGULARISATION:\n")
+cat("  Method: Proper trace-based scaling\n")
+cat("  Formula: lambda_eff = lambda_base * tr(X'X) / p\n")
+cat("  Interpretation: Regularisation as fraction of average information\n")
+cat("  Base parameter selected: lambda_base =", best_lambda, "\n")
+
+cat("\nOBJECTIVE 4 STRUCTURE:\n")
+cat("  PART A - STRUCTURAL PREDICTION (Practical Value)\n")
+cat("    Question: Can we predict efficiency from design choices alone?\n")
+cat("    Predictors: k, nc, rf, ra, alpha, N\n")
+cat("    Metric: R² (predictive accuracy matters here)\n")
+cat("    Key output: obj4_PART_A_structural_metrics.csv\n")
+cat("\n")
+cat("  PART B - EXPLANATORY ANALYSIS (Scientific Value)\n")
+cat("    Question: Which features EXPLAIN efficiency variation?\n")
+cat("    Predictors: Structural + Spectral features\n")
+cat("    Metric: Variable importance rankings (R² NOT reported)\n")
+cat("    Key outputs:\n")
+cat("      - obj4_importance_by_category.csv (structural vs spectral)\n")
+cat("      - obj4_importance_by_dimensional_band.csv (low-k vs high-k)\n")
+
+cat("\nKEY OUTPUT FILES:\n")
+cat("  Obj 1: results_tables/obj1_mean_efficiency_by_k_family.csv\n")
+cat("  Obj 2: results_tables1/obj2_spectral_summary_by_k_family.csv\n")
+cat("  Obj 3: results_tables2/obj3_CDS_stability_indices.csv\n")
+cat("  Obj 4 Part A: results_tables4/obj4_PART_A_summary.csv\n")
+cat("  Obj 4 Part B: results_tables4/obj4_importance_by_category.csv\n")
+cat("  Obj 4 Part B: results_tables4/obj4_importance_by_dimensional_band.csv\n")
+
+cat("\nTotal designs analysed: N =", nrow(design_metadata), "\n")
+cat(rep("=", 70), "\n", sep = "")
+```
+
+```{r}
+cat("\n=== OBJECTIVE 3: Cross-Dimensional Stability (Per-k Analysis) ===\n")
+
+# Load required packages for rolling calculations
+if (!requireNamespace("zoo", quietly = TRUE)) install.packages("zoo", quiet = TRUE)
+library(zoo)
+
+stopifnot(exists("df_all"))
+
+eff_cols <- c("Deff", "Aeff", "Geff")
+miss <- setdiff(eff_cols, names(df_all))
+if (length(miss) > 0) {
+  stop("Missing efficiency columns in df_all: ", paste(miss, collapse = ", "))
+}
+
+df_obj3 <- df_all %>%
+  dplyr::mutate(k = as.integer(k), family = as.factor(family))
+
+# --- 3A: Reshape to long format ---
+
+eff_long <- df_obj3 %>%
+  dplyr::select(k, family, dplyr::all_of(eff_cols)) %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(eff_cols),
+    names_to  = "criterion",
+    values_to = "eff"
+  ) %>%
+  dplyr::mutate(
+    criterion = dplyr::recode(criterion,
+      Deff = "D", Aeff = "A", Geff = "G"),
+    criterion = factor(criterion, levels = c("D", "A", "G"))
+  )
+
+# --- 3B: Mean efficiency by (k, family, criterion) ---
+
+tab_mean_o3 <- eff_long %>%
+  dplyr::group_by(k, family, criterion) %>%
+  dplyr::summarise(
+    meanEff = mean(eff, na.rm = TRUE),
+    sdEff   = sd(eff,   na.rm = TRUE),
+    n       = sum(!is.na(eff)),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_mean_o3,
+  "results_tables2/obj3_mean_efficiency_by_k_family.csv")
+
+
+# ============================================================
+# NEW: PER-k CDS CALCULATIONS
+# ============================================================
+
+# --- 3C: Compute CDS for EACH k ---
+
+cds_per_k <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::arrange(k) %>%
+  dplyr::mutate(
+    # Method 1: Absolute change from previous k
+    CDS_change = abs(meanEff - dplyr::lag(meanEff)),
+   
+    # Method 2: Percentage change from previous k
+    CDS_pct_change = abs((meanEff - dplyr::lag(meanEff)) / dplyr::lag(meanEff)) * 100,
+   
+    # Method 3: Rolling variance (window = 3, centered)
+    CDS_rolling_var = zoo::rollapply(
+      meanEff,
+      width = 3,
+      FUN = var,
+      fill = NA,
+      align = "center"
+    ),
+   
+    # Method 4: Cumulative CV up to k
+    CDS_cumul_cv = sapply(seq_along(meanEff), function(i) {
+      if (i < 2) return(NA)
+      vals <- meanEff[1:i]
+      sd(vals, na.rm = TRUE) / mean(vals, na.rm = TRUE)
+    })
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(cds_per_k,
+  "results_tables2/obj3_CDS_per_k.csv")
+
+cat("\n--- CDS Per k (First 20 rows) ---\n")
+print(head(cds_per_k, 20))
+
+
+# --- 3D: Aggregate CDS stability indices (original method) ---
+
+cds_summary <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::summarise(
+    CDS_variance   = var(meanEff,  na.rm = TRUE),
+    CDS_sd         = sd(meanEff,   na.rm = TRUE),
+    CDS_range      = max(meanEff)  - min(meanEff),
+    CDS_end_change = meanEff[k == max(k)][1] - meanEff[k == min(k)][1],
+    mean_over_k    = mean(meanEff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(cds_summary,
+  "results_tables2/obj3_CDS_stability_indices.csv")
+
+
+# --- 3E: Scaling law exponents with significance testing ---
+
+scaling_exponents <- tab_mean_o3 %>%
+  dplyr::filter(meanEff > 0) %>%
+  dplyr::mutate(logEff = log(meanEff), logk = log(k)) %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::do({
+    fit <- lm(logEff ~ logk, data = .)
+    sm  <- summary(fit)
+    tibble::tibble(
+      beta0    = coef(fit)[["(Intercept)"]],
+      beta1    = coef(fit)[["logk"]],
+      SE_beta1 = sm$coefficients["logk", "Std. Error"],
+      t_stat   = sm$coefficients["logk", "t value"],
+      p_value  = sm$coefficients["logk", "Pr(>|t|)"],
+      R2       = sm$r.squared,
+      adj_R2   = sm$adj.r.squared,
+      sig      = dplyr::case_when(
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.001 ~ "***",
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.01  ~ "**",
+        sm$coefficients["logk", "Pr(>|t|)"] < 0.05  ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(scaling_exponents,
+  "results_tables2/obj3_scaling_exponents.csv")
+
+cat("\n--- Scaling Exponents Table ---\n")
+print(scaling_exponents %>%
+        dplyr::select(family, criterion, beta1, SE_beta1, p_value, sig, R2))
+
+
+# ============================================================
+# NEW: PER-k CDS VISUALIZATIONS
+# ============================================================
+
+# --- 3F: Heatmaps for CDS per k ---
+
+library(reshape2)
+
+# Function to create CDS heatmap for any criterion
+create_cds_heatmap <- function(data, cds_col, criterion_filter, title_text) {
+ 
+  # Subset data for specific criterion
+  plot_data <- data %>%
+    dplyr::filter(criterion == criterion_filter) %>%
+    dplyr::select(family, k, !!rlang::sym(cds_col)) %>%
+    dplyr::filter(!is.na(!!rlang::sym(cds_col)))
+ 
+  if (nrow(plot_data) == 0) return(NULL)
+ 
+  # Convert to matrix form
+  data_matrix <- reshape2::dcast(plot_data, family ~ k, value.var = cds_col)
+  rownames(data_matrix) <- data_matrix$family
+  data_matrix <- as.matrix(data_matrix[, -1])
+ 
+  # Log scale for variance (handle zeros/negatives)
+  if (grepl("var", cds_col, ignore.case = TRUE)) {
+    data_matrix[data_matrix <= 0] <- NA
+    data_matrix <- log10(data_matrix)
+    fill_label <- paste0("log10(", cds_col, ")")
+  } else {
+    fill_label <- cds_col
+  }
+ 
+  # Melt for ggplot
+  data_melt <- reshape2::melt(data_matrix)
+  colnames(data_melt) <- c("Family", "k", "value")
+ 
+  # Create heatmap
+  p <- ggplot(data_melt, aes(x = factor(k), y = Family, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(value, 3)), color = "white", size = 3.5) +
+    scale_fill_gradient(
+      low = "lightblue", high = "darkblue",
+      name = fill_label,
+      na.value = "grey80"
+    ) +
+    labs(
+      title = title_text,
+      x = "Dimension (k)",
+      y = "CCD Family"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text = element_text(size = 11),
+      panel.grid = element_blank()
+    )
+ 
+  return(p)
+}
+
+# Create heatmaps for each criterion using rolling variance
+p_D_var <- create_cds_heatmap(cds_per_k, "CDS_rolling_var", "D",
+                               "CDS Rolling Variance (D-efficiency)")
+p_A_var <- create_cds_heatmap(cds_per_k, "CDS_rolling_var", "A",
+                               "CDS Rolling Variance (A-efficiency)")
+p_G_var <- create_cds_heatmap(cds_per_k, "CDS_rolling_var", "G",
+                               "CDS Rolling Variance (G-efficiency)")
+
+# Save individual heatmaps
+if (!is.null(p_D_var)) ggsave("results_figures2/obj3_CDS_heatmap_D_per_k.png",
+                               p_D_var, width = 10, height = 5)
+if (!is.null(p_A_var)) ggsave("results_figures2/obj3_CDS_heatmap_A_per_k.png",
+                               p_A_var, width = 10, height = 5)
+if (!is.null(p_G_var)) ggsave("results_figures2/obj3_CDS_heatmap_G_per_k.png",
+                               p_G_var, width = 10, height = 5)
+
+
+# --- 3G: Line plots showing CDS change across k ---
+
+# CDS Absolute Change
+p_cds_change <- ggplot(cds_per_k %>% dplyr::filter(!is.na(CDS_change)),
+    aes(x = k, y = CDS_change,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "CDS: |E(k) - E(k-1)|",
+    title  = "Cross-Dimensional Stability: Absolute Change Per k",
+    subtitle = "Lower values indicate more stable transitions between dimensions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_CDS_change_per_k.png",
+       p_cds_change, width = 12, height = 5)
+
+
+# CDS Percentage Change
+p_cds_pct <- ggplot(cds_per_k %>% dplyr::filter(!is.na(CDS_pct_change)),
+    aes(x = k, y = CDS_pct_change,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "CDS: % Change from Previous k",
+    title  = "Cross-Dimensional Stability: Percentage Change Per k",
+    subtitle = "Lower values indicate more stable transitions between dimensions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_CDS_pct_change_per_k.png",
+       p_cds_pct, width = 12, height = 5)
+
+
+# CDS Rolling Variance
+p_cds_rolling <- ggplot(cds_per_k %>% dplyr::filter(!is.na(CDS_rolling_var)),
+    aes(x = k, y = CDS_rolling_var,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  scale_x_continuous(breaks = 3:10) +
+  scale_y_log10() +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "CDS: Rolling Variance (log scale)",
+    title  = "Cross-Dimensional Stability: Local Variance Per k",
+    subtitle = "Rolling window = 3, centered at each k"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_CDS_rolling_var_per_k.png",
+       p_cds_rolling, width = 12, height = 5)
+
+
+# --- 3H: Combined heatmap panel (all three criteria) ---
+
+# Prepare data for combined heatmap
+cds_heat_data <- cds_per_k %>%
+  dplyr::filter(!is.na(CDS_rolling_var)) %>%
+  dplyr::mutate(
+    log_CDS_var = log10(CDS_rolling_var + 1e-10),
+    criterion_label = dplyr::recode(criterion,
+      D = "D-efficiency",
+      A = "A-efficiency",
+      G = "G-efficiency"
+    )
+  )
+
+p_combined_heat <- ggplot(cds_heat_data,
+    aes(x = factor(k), y = family, fill = log_CDS_var)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(log_CDS_var, 2)), color = "white", size = 3) +
+  facet_wrap(~criterion_label, ncol = 1) +
+  scale_fill_gradient(
+    low = "lightblue", high = "darkblue",
+    name = "log10(CDS Var)"
+  ) +
+  labs(
+    title = "Cross-Dimensional Stability Per k",
+    subtitle = "Rolling variance (window=3) at each dimension",
+    x = "Dimension (k)",
+    y = "CCD Family"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+ggsave("results_figures2/obj3_CDS_combined_heatmap.png",
+       p_combined_heat, width = 10, height = 10)
+
+
+# --- 3I: Original plots (retained from original code) ---
+
+# Mean efficiency curves faceted by criterion
+p_curves <- ggplot(tab_mean_o3,
+    aes(k, meanEff,
+        colour = family, linetype = family,
+        shape = family, group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.6) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x      = "Number of factors (k)",
+    y      = "Mean Efficiency",
+    title  = "Cross-Dimensional Mean Efficiency Curves"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_mean_efficiency_curves.png",
+       p_curves, width = 12, height = 5)
+
+
+# Scaling exponents bar chart
+p_beta <- ggplot(scaling_exponents,
+    aes(x = family, y = beta1, fill = family)) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = paste0(round(beta1, 3), "\n", sig)),
+    vjust = ifelse(scaling_exponents$beta1 >= 0, -0.3, 1.2),
+    size  = 3.5
+  ) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(criterion = c(
+               D = "D-efficiency",
+               A = "A-efficiency",
+               G = "G-efficiency"
+             ))) +
+  labs(
+    x     = "CCD Family",
+    y     = expression(hat(beta)[1] ~ "(Scaling Exponent)"),
+    title = "Scaling Exponents with Significance Levels"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+ggsave("results_figures2/obj3_scaling_exponents.png",
+       p_beta, width = 11, height = 5)
+
+
+# Aggregate CDS variance heatmap (original)
+p_heat <- ggplot(cds_summary,
+    aes(x = criterion, y = family, fill = CDS_variance)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(CDS_variance, 4)), size = 3.5) +
+  scale_fill_gradient(low = "#d1e5f0", high = "#2166ac") +
+  labs(
+    x     = "Efficiency Criterion",
+    y     = "CCD Family",
+    fill  = "CDS Variance",
+    title = "Cross-Dimensional Stability Variance (Aggregate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures2/obj3_CDS_heatmap_aggregate.png",
+       p_heat, width = 8, height = 5)
+
+
+# ============================================================
+# SUMMARY TABLE: CDS Per k
+# ============================================================
+
+cat("\n--- Summary: CDS Statistics by Family and Criterion ---\n")
+cds_summary_extended <- cds_per_k %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::summarise(
+    # Aggregate measures
+    CDS_var_aggregate = var(meanEff, na.rm = TRUE),
+    # Per-k measures averaged
+    mean_CDS_change = mean(CDS_change, na.rm = TRUE),
+    max_CDS_change = max(CDS_change, na.rm = TRUE),
+    mean_CDS_pct_change = mean(CDS_pct_change, na.rm = TRUE),
+    max_CDS_pct_change = max(CDS_pct_change, na.rm = TRUE),
+    mean_rolling_var = mean(CDS_rolling_var, na.rm = TRUE),
+    # Location of max instability
+    k_max_change = k[which.max(CDS_change)],
+    .groups = "drop"
+  )
+
+readr::write_csv(cds_summary_extended,
+  "results_tables2/obj3_CDS_summary_extended.csv")
+
+print(cds_summary_extended)
+
+
+cat("\nObjective 3 (Modified) complete.\n")
+cat("New outputs:\n")
+cat("  - obj3_CDS_per_k.csv: CDS values for each k\n")
+cat("  - obj3_CDS_heatmap_D_per_k.png: D-efficiency CDS heatmap\n")
+cat("  - obj3_CDS_heatmap_A_per_k.png: A-efficiency CDS heatmap\n")
+cat("  - obj3_CDS_heatmap_G_per_k.png: G-efficiency CDS heatmap\n")
+cat("  - obj3_CDS_combined_heatmap.png: All criteria combined\n")
+cat("  - obj3_CDS_change_per_k.png: Absolute change line plot\n")
+cat("  - obj3_CDS_pct_change_per_k.png: Percentage change line plot\n")
+cat("  - obj3_CDS_rolling_var_per_k.png: Rolling variance line plot\n")
+
+```
+```{r}
+# ============================================================
+# OBJECTIVE 3: CROSS-DIMENSIONAL STABILITY (CDS)
+#
+# CDS is defined as the structural stability of efficiency
+# across increasing dimensionality (k = 3 to 10).
+#
+# We measure CDS using:
+#   (1) Global stability (variance across k)
+#   (2) Local instability (|E(k) - E(k-1)|)
+#   (3) Scaling exponent from log–log model
+#
+# All measures use scaled regularised efficiencies.
+# ============================================================
+
+cat("\n=== OBJECTIVE 3: Cross-Dimensional Stability (CDS) ===\n")
+
+stopifnot(exists("df_all"))
+
+eff_cols <- c("Deff", "Aeff", "Geff")
+
+df_obj3 <- df_all %>%
+  dplyr::mutate(k = as.integer(k),
+                family = as.factor(family))
+
+# ------------------------------------------------------------
+# 3A: Reshape efficiency to long format
+# ------------------------------------------------------------
+
+eff_long <- df_obj3 %>%
+  dplyr::select(k, family, dplyr::all_of(eff_cols)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(eff_cols),
+    names_to = "criterion",
+    values_to = "eff"
+  ) %>%
+  dplyr::mutate(
+    criterion = dplyr::recode(criterion,
+                              Deff = "D",
+                              Aeff = "A",
+                              Geff = "G")
+  )
+
+# ------------------------------------------------------------
+# 3B: Mean efficiency at each k
+# ------------------------------------------------------------
+
+tab_mean_o3 <- eff_long %>%
+  dplyr::group_by(k, family, criterion) %>%
+  dplyr::summarise(
+    meanEff = mean(eff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(tab_mean_o3,
+  "results_tables2/obj3_mean_efficiency_by_k_family.csv")
+
+# ------------------------------------------------------------
+# 3C: GLOBAL CDS (variance across k)
+# ------------------------------------------------------------
+
+cds_global <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::summarise(
+    CDS_variance = var(meanEff, na.rm = TRUE),
+    CDS_range    = max(meanEff) - min(meanEff),
+    CDS_end_diff = meanEff[k == max(k)][1] -
+                   meanEff[k == min(k)][1],
+    .groups = "drop"
+  )
+
+readr::write_csv(cds_global,
+  "results_tables2/obj3_CDS_global.csv")
+
+# ------------------------------------------------------------
+# 3D: LOCAL CDS (change between consecutive k)
+# ------------------------------------------------------------
+
+cds_local <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::arrange(k) %>%
+  dplyr::mutate(
+    CDS_change = abs(meanEff - dplyr::lag(meanEff))
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(cds_local,
+  "results_tables2/obj3_CDS_local_per_k.csv")
+
+# ------------------------------------------------------------
+# 3E: SCALING LAW (Cross-Dimensional Exponent)
+# Model: log(E) = β0 + β1 log(k)
+# ------------------------------------------------------------
+
+scaling_exponents <- tab_mean_o3 %>%
+  dplyr::filter(meanEff > 0) %>%
+  dplyr::mutate(logEff = log(meanEff),
+                logk   = log(k)) %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::do({
+    fit <- lm(logEff ~ logk, data = .)
+    sm  <- summary(fit)
+    tibble::tibble(
+      beta1   = coef(fit)[2],
+      p_value = sm$coefficients[2,4],
+      R2      = sm$r.squared
+    )
+  }) %>%
+  dplyr::ungroup()
+
+readr::write_csv(scaling_exponents,
+  "results_tables2/obj3_scaling_exponents.csv")
+
+print(scaling_exponents)
+
+# ------------------------------------------------------------
+# 3F: CDS Plots
+# ------------------------------------------------------------
+
+# Mean efficiency curves
+p1 <- ggplot(tab_mean_o3,
+    aes(k, meanEff,
+        colour = family,
+        group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y") +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x = "Number of factors (k)",
+    y = "Mean Efficiency",
+    title = "Cross-Dimensional Efficiency Behaviour"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures2/obj3_mean_efficiency_curves.png",
+       p1, width = 12, height = 5)
+
+# Local instability plot
+p2 <- ggplot(cds_local %>% dplyr::filter(!is.na(CDS_change)),
+    aes(k, CDS_change,
+        colour = family,
+        group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y") +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x = "Number of factors (k)",
+    y = "|E(k) - E(k-1)|",
+    title = "Local Cross-Dimensional Instability"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("results_figures2/obj3_CDS_local_change.png",
+       p2, width = 12, height = 5)
+
+cat("Objective 3 complete.\n")
+```
+```{r}
+# ============================================================
+# CDS MAP ACROSS DIMENSIONS (k)
+# ============================================================
+
+cat("\n=== CDS MAP ACROSS k ===\n")
+
+# ------------------------------------------------------------
+# Step 1: Compute local instability at each k
+# CDS(k) = |E(k) - E(k-1)|
+# ------------------------------------------------------------
+
+cds_map <- tab_mean_o3 %>%
+  dplyr::group_by(family, criterion) %>%
+  dplyr::arrange(k) %>%
+  dplyr::mutate(
+    CDS_k = abs(meanEff - dplyr::lag(meanEff))
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(cds_map,
+  "results_tables2/obj3_CDS_map_per_k.csv")
+
+# ------------------------------------------------------------
+# Step 2: Heatmap (True CDS Map)
+# ------------------------------------------------------------
+
+p_cds_map <- ggplot(cds_map %>% dplyr::filter(!is.na(CDS_k)),
+    aes(x = factor(k), y = family, fill = CDS_k)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(CDS_k, 3)),
+            size = 3.5, color = "white") +
+  facet_wrap(~criterion,
+             labeller = labeller(
+               criterion = c(
+                 D = "D-efficiency",
+                 A = "A-efficiency",
+                 G = "G-efficiency"
+               )
+             )) +
+  scale_fill_gradient(
+    low = "#d1e5f0",
+    high = "#08306b",
+    name = "CDS(k)"
+  ) +
+  labs(
+    x = "Dimension (k)",
+    y = "CCD Family",
+    title = "Cross-Dimensional Stability (CDS) Map",
+    subtitle = "Local instability: |E(k) − E(k−1)|"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave("results_figures2/obj3_CDS_map_heatmap.png",
+       p_cds_map, width = 12, height = 6)
+
+# ------------------------------------------------------------
+# Step 3: Line profile of instability growth
+# ------------------------------------------------------------
+
+p_cds_line <- ggplot(cds_map %>% dplyr::filter(!is.na(CDS_k)),
+    aes(k, CDS_k,
+        colour = family,
+        group = family)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~criterion, scales = "free_y",
+             labeller = labeller(
+               criterion = c(
+                 D = "D-efficiency",
+                 A = "A-efficiency",
+                 G = "G-efficiency"
+               )
+             )) +
+  scale_x_continuous(breaks = 3:10) +
+  labs(
+    x = "Dimension (k)",
+    y = "CDS(k)",
+    title = "Dimension-wise Instability Profile",
+    subtitle = "Higher values indicate stronger cross-dimensional fluctuation"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("results_figures2/obj3_CDS_map_line.png",
+       p_cds_line, width = 12, height = 5)
+
+cat("CDS map across k generated successfully.\n")
+```
+
